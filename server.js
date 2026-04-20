@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -8,7 +9,9 @@ const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'leaderboard.json');
 const GUESTBOOK_FILE = path.join(DATA_DIR, 'guestbook.json');
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString('hex');
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_ENTRIES = 5000;
 const MAX_GUEST_ENTRIES = 2000;
@@ -198,6 +201,26 @@ setInterval(() => {
   }
 }, 60000).unref();
 
+function timingSafeEq(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    const pad = Buffer.alloc(Math.max(ab.length, bb.length, 1));
+    try { crypto.timingSafeEqual(pad, pad); } catch (_) {}
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function requireAdmin(req, res) {
+  const token = req.headers['x-admin-token'] || '';
+  if (!ADMIN_TOKEN || !timingSafeEq(token, ADMIN_TOKEN)) {
+    sendJSON(res, 401, { error: '관리자 권한이 필요합니다.' });
+    return false;
+  }
+  return true;
+}
+
 function getClientIp(req) {
   const h = req.headers['x-forwarded-for'];
   if (typeof h === 'string' && h.length) return h.split(',')[0].trim();
@@ -228,9 +251,7 @@ async function handleApi(req, res, url) {
     return sendJSON(res, 201, { entry, list });
   }
   if (url === '/api/leaderboard/clear' && req.method === 'POST') {
-    if (!ADMIN_TOKEN) return sendJSON(res, 503, { error: '서버에 ADMIN_TOKEN이 설정되지 않았습니다.' });
-    const token = req.headers['x-admin-token'] || '';
-    if (token !== ADMIN_TOKEN) return sendJSON(res, 401, { error: '관리자 토큰이 올바르지 않습니다.' });
+    if (!requireAdmin(req, res)) return;
     await writeBoard([]);
     return sendJSON(res, 200, { ok: true });
   }
@@ -253,10 +274,57 @@ async function handleApi(req, res, url) {
     return sendJSON(res, 201, { entry, list });
   }
   if (url === '/api/guestbook/clear' && req.method === 'POST') {
-    if (!ADMIN_TOKEN) return sendJSON(res, 503, { error: '서버에 ADMIN_TOKEN이 설정되지 않았습니다.' });
-    const token = req.headers['x-admin-token'] || '';
-    if (token !== ADMIN_TOKEN) return sendJSON(res, 401, { error: '관리자 토큰이 올바르지 않습니다.' });
+    if (!requireAdmin(req, res)) return;
     await writeGuestbook([]);
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (url === '/api/guestbook/edit' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String(body && body.id || '');
+    const message = String(body && body.message || '').replace(/\r\n/g, '\n').trim();
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > MAX_MSG_LEN) return sendJSON(res, 400, { error: 'message too long' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    list[idx].message = message;
+    list[idx].editedAt = Date.now();
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { entry: list[idx], list });
+  }
+  if (url === '/api/guestbook/delete' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String(body && body.id || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    list.splice(idx, 1);
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { ok: true, list });
+  }
+  if (url === '/api/admin/login' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 8, 60000)) return sendJSON(res, 429, { error: '로그인 시도가 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const u = String(body && body.username || '');
+    const p = String(body && body.password || '');
+    const okUser = timingSafeEq(u, ADMIN_USERNAME);
+    const okPass = timingSafeEq(p, ADMIN_PASSWORD);
+    if (!(okUser && okPass)) return sendJSON(res, 401, { error: '아이디 또는 비밀번호가 올바르지 않습니다.' });
+    return sendJSON(res, 200, { token: ADMIN_TOKEN });
+  }
+  if (url === '/api/admin/verify' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
     return sendJSON(res, 200, { ok: true });
   }
   if (url === '/api/health' && req.method === 'GET') {
@@ -310,5 +378,8 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`wonang-plants server listening on http://${HOST}:${PORT}`);
   console.log(`data file: ${DATA_FILE}`);
-  if (!ADMIN_TOKEN) console.log('ADMIN_TOKEN not set — /api/leaderboard/clear is disabled.');
+  if (!process.env.ADMIN_TOKEN) console.log('ADMIN_TOKEN env not set — a random one was generated for this run.');
+  if (!process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD) {
+    console.log(`Admin credentials: ${ADMIN_USERNAME} / ${ADMIN_PASSWORD} (override via ADMIN_USERNAME / ADMIN_PASSWORD env).`);
+  }
 });
