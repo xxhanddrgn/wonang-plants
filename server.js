@@ -10,6 +10,14 @@ const DATA_FILE = path.join(DATA_DIR, 'leaderboard.json');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_ENTRIES = 5000;
+const GRADE_CLASS_MAP = {
+  1: [1, 2],
+  2: [1, 2],
+  3: [1, 2, 3],
+  4: [1, 2],
+  5: [1, 2, 3],
+  6: [1, 2, 3]
+};
 
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 if (!fs.existsSync(DATA_FILE)) {
@@ -110,8 +118,11 @@ function validateEntry(body) {
   if (role === 'student') {
     grade = Math.floor(Number(body.grade));
     classNum = Math.floor(Number(body.classNum));
-    if (!Number.isFinite(grade) || grade < 1 || grade > 6) errs.push('grade must be 1-6');
-    if (!Number.isFinite(classNum) || classNum < 1 || classNum > 30) errs.push('classNum must be 1-30');
+    const allowed = GRADE_CLASS_MAP[grade];
+    if (!allowed) errs.push('grade must be 1-6');
+    else if (!Number.isFinite(classNum) || !allowed.includes(classNum)) {
+      errs.push('classNum not allowed for this grade');
+    }
   }
   if (errs.length) return { errs };
   return {
