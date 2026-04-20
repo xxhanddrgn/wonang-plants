@@ -105,10 +105,18 @@ function validateEntry(body) {
   if (!Number.isFinite(score) || score < 0 || score > maxScore) errs.push('score out of range');
   const durationMs = Math.floor(Number(body.durationMs));
   if (!Number.isFinite(durationMs) || durationMs < 0 || durationMs > 24 * 60 * 60 * 1000) errs.push('duration out of range');
+
+  let grade = null, classNum = null;
+  if (role === 'student') {
+    grade = Math.floor(Number(body.grade));
+    classNum = Math.floor(Number(body.classNum));
+    if (!Number.isFinite(grade) || grade < 1 || grade > 6) errs.push('grade must be 1-6');
+    if (!Number.isFinite(classNum) || classNum < 1 || classNum > 30) errs.push('classNum must be 1-30');
+  }
   if (errs.length) return { errs };
   return {
     errs,
-    clean: { name, role, total, correct, score, durationMs }
+    clean: { name, role, total, correct, score, durationMs, grade, classNum }
   };
 }
 
