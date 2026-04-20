@@ -7,9 +7,12 @@ const HOST = process.env.HOST || '0.0.0.0';
 const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'leaderboard.json');
+const GUESTBOOK_FILE = path.join(DATA_DIR, 'guestbook.json');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_ENTRIES = 5000;
+const MAX_GUEST_ENTRIES = 2000;
+const MAX_MSG_LEN = 500;
 const GRADE_CLASS_MAP = {
   1: [1, 2],
   2: [1, 2],
@@ -22,6 +25,9 @@ const GRADE_CLASS_MAP = {
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 if (!fs.existsSync(DATA_FILE)) {
   try { fs.writeFileSync(DATA_FILE, '[]', 'utf-8'); } catch (e) {}
+}
+if (!fs.existsSync(GUESTBOOK_FILE)) {
+  try { fs.writeFileSync(GUESTBOOK_FILE, '[]', 'utf-8'); } catch (e) {}
 }
 
 const MIME = {
@@ -65,6 +71,49 @@ function writeBoard(list) {
     });
   })).catch((err) => { console.error('writeBoard failed', err); });
   return writeChain;
+}
+
+function readGuestbook() {
+  try {
+    const raw = fs.readFileSync(GUESTBOOK_FILE, 'utf-8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+let guestWriteChain = Promise.resolve();
+function writeGuestbook(list) {
+  guestWriteChain = guestWriteChain.then(() => new Promise((resolve, reject) => {
+    const tmp = GUESTBOOK_FILE + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(list), 'utf-8', (err) => {
+      if (err) return reject(err);
+      fs.rename(tmp, GUESTBOOK_FILE, (err2) => err2 ? reject(err2) : resolve());
+    });
+  })).catch((err) => { console.error('writeGuestbook failed', err); });
+  return guestWriteChain;
+}
+
+function validateGuestPost(body) {
+  if (!body || typeof body !== 'object') return { errs: ['invalid body'] };
+  const errs = [];
+  const name = String(body.name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+  if (!name) errs.push('name required');
+  const role = body.role === 'teacher' ? 'teacher' : 'student';
+  let grade = null, classNum = null;
+  if (role === 'student') {
+    grade = Math.floor(Number(body.grade));
+    classNum = Math.floor(Number(body.classNum));
+    const allowed = GRADE_CLASS_MAP[grade];
+    if (!allowed) errs.push('grade must be 1-6');
+    else if (!Number.isFinite(classNum) || !allowed.includes(classNum)) {
+      errs.push('classNum not allowed for this grade');
+    }
+  }
+  const message = String(body.message || '').replace(/\r\n/g, '\n').trim();
+  if (!message) errs.push('message required');
+  else if (message.length > MAX_MSG_LEN) errs.push('message too long');
+  if (errs.length) return { errs };
+  return { errs, clean: { name, role, grade, classNum, message } };
 }
 
 function sendJSON(res, status, data) {
@@ -185,8 +234,33 @@ async function handleApi(req, res, url) {
     await writeBoard([]);
     return sendJSON(res, 200, { ok: true });
   }
+  if (url === '/api/guestbook' && req.method === 'GET') {
+    return sendJSON(res, 200, { list: readGuestbook() });
+  }
+  if (url === '/api/guestbook' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const { errs, clean } = validateGuestPost(body);
+    if (errs && errs.length) return sendJSON(res, 400, { error: '유효하지 않은 요청', details: errs });
+    const list = readGuestbook();
+    const entry = Object.assign({ id: 'g_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8), timestamp: Date.now() }, clean);
+    list.push(entry);
+    if (list.length > MAX_GUEST_ENTRIES) list.splice(0, list.length - MAX_GUEST_ENTRIES);
+    await writeGuestbook(list);
+    return sendJSON(res, 201, { entry, list });
+  }
+  if (url === '/api/guestbook/clear' && req.method === 'POST') {
+    if (!ADMIN_TOKEN) return sendJSON(res, 503, { error: '서버에 ADMIN_TOKEN이 설정되지 않았습니다.' });
+    const token = req.headers['x-admin-token'] || '';
+    if (token !== ADMIN_TOKEN) return sendJSON(res, 401, { error: '관리자 토큰이 올바르지 않습니다.' });
+    await writeGuestbook([]);
+    return sendJSON(res, 200, { ok: true });
+  }
   if (url === '/api/health' && req.method === 'GET') {
-    return sendJSON(res, 200, { ok: true, entries: readBoard().length });
+    return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
   return sendJSON(res, 404, { error: 'not found' });
 }
