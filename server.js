@@ -112,7 +112,7 @@ function writeGuestbook(list) {
 }
 
 const AUTHOR_KEY_RE = /^[a-zA-Z0-9_-]{8,64}$/;
-const REACTION_TYPES = ['heart', 'thumbs', 'smile', 'check'];
+const REACTION_TYPES = ['heart', 'thumbs'];
 const VALID_ROLES = ['student', 'teacher', 'guest'];
 function normalizeRole(r) {
   return VALID_ROLES.includes(r) ? r : 'student';
