@@ -1,0 +1,13 @@
+{
+  "name": "wonang-plants",
+  "version": "1.0.0",
+  "private": true,
+  "description": "대전원앙초등학교 식물가족 퀴즈 플랫폼",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
