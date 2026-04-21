@@ -11,7 +11,12 @@ const DATA_FILE = path.join(DATA_DIR, 'leaderboard.json');
 const GUESTBOOK_FILE = path.join(DATA_DIR, 'guestbook.json');
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString('hex');
+const ADMIN_TOKEN_RAW = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString('hex');
+// HTTP headers must be ISO-8859-1. If the env-provided token contains
+// non-ASCII characters we hash it so the over-the-wire value is always hex.
+const ADMIN_TOKEN = /^[\x20-\x7E]+$/.test(ADMIN_TOKEN_RAW)
+  ? ADMIN_TOKEN_RAW
+  : crypto.createHash('sha256').update(ADMIN_TOKEN_RAW).digest('hex');
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_ENTRIES = 5000;
 const MAX_GUEST_ENTRIES = 2000;
@@ -107,6 +112,7 @@ function writeGuestbook(list) {
 }
 
 const AUTHOR_KEY_RE = /^[a-zA-Z0-9_-]{8,64}$/;
+const REACTION_TYPES = ['heart', 'thumbs', 'smile', 'check'];
 const VALID_ROLES = ['student', 'teacher', 'guest'];
 function normalizeRole(r) {
   return VALID_ROLES.includes(r) ? r : 'student';
@@ -381,6 +387,31 @@ async function handleApi(req, res, url) {
     list.splice(idx, 1);
     await writeGuestbook(list);
     return sendJSON(res, 200, { ok: true, list });
+  }
+  if (url === '/api/guestbook/react' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String(body && body.id || '');
+    const authorKey = String(body && body.authorKey || '');
+    const reaction = String(body && body.reaction || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!REACTION_TYPES.includes(reaction)) return sendJSON(res, 400, { error: 'reaction invalid' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    const post = list[idx];
+    if (!post.reactions || typeof post.reactions !== 'object') post.reactions = {};
+    const bucket = Array.isArray(post.reactions[reaction]) ? post.reactions[reaction] : [];
+    const pos = bucket.indexOf(authorKey);
+    if (pos === -1) bucket.push(authorKey);
+    else bucket.splice(pos, 1);
+    post.reactions[reaction] = bucket;
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { entry: post, list });
   }
   if (url === '/api/guestbook/clear' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
