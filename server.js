@@ -60,8 +60,14 @@ const MIME = {
   '.svg':  'image/svg+xml',
   '.webp': 'image/webp',
   '.ico':  'image/x-icon',
-  '.txt':  'text/plain; charset=utf-8'
+  '.txt':  'text/plain; charset=utf-8',
+  '.mp3':  'audio/mpeg',
+  '.m4a':  'audio/mp4',
+  '.ogg':  'audio/ogg',
+  '.wav':  'audio/wav'
 };
+const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.ogg', '.wav']);
+const AUDIO_DIR = path.join(ROOT, 'audio');
 
 function safeJoin(root, reqPath) {
   const decoded = decodeURIComponent(reqPath.split('?')[0]);
@@ -466,6 +472,17 @@ async function handleApi(req, res, url) {
   if (url === '/api/admin/verify' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
     return sendJSON(res, 200, { ok: true });
+  }
+  if (url === '/api/audio/list' && req.method === 'GET') {
+    let files = [];
+    try {
+      files = fs.readdirSync(AUDIO_DIR)
+        .filter((f) => AUDIO_EXTS.has(path.extname(f).toLowerCase()))
+        .filter((f) => !f.startsWith('.'))
+        .sort()
+        .map((f) => '/audio/' + encodeURIComponent(f));
+    } catch (_) { /* directory may not exist yet */ }
+    return sendJSON(res, 200, { files });
   }
   if (url === '/api/health' && req.method === 'GET') {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
