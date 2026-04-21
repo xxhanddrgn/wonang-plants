@@ -107,13 +107,17 @@ function writeGuestbook(list) {
 }
 
 const AUTHOR_KEY_RE = /^[a-zA-Z0-9_-]{8,64}$/;
+const VALID_ROLES = ['student', 'teacher', 'guest'];
+function normalizeRole(r) {
+  return VALID_ROLES.includes(r) ? r : 'student';
+}
 
 function validateGuestPost(body) {
   if (!body || typeof body !== 'object') return { errs: ['invalid body'] };
   const errs = [];
   const name = String(body.name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
   if (!name) errs.push('name required');
-  const role = body.role === 'teacher' ? 'teacher' : 'student';
+  const role = normalizeRole(body.role);
   let grade = null, classNum = null;
   if (role === 'student') {
     grade = Math.floor(Number(body.grade));
@@ -169,7 +173,7 @@ function validateEntry(body) {
   const errs = [];
   const name = String(body.name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
   if (!name) errs.push('name required');
-  const role = body.role === 'teacher' ? 'teacher' : 'student';
+  const role = normalizeRole(body.role);
   const total = Math.floor(Number(body.total));
   if (!Number.isFinite(total) || total <= 0 || total > 200) errs.push('total out of range');
   const correct = Math.floor(Number(body.correct));
@@ -246,9 +250,10 @@ function genId() {
 }
 
 function userKey(e) {
-  const role = e && e.role === 'teacher' ? 'teacher' : 'student';
+  const role = normalizeRole(e && e.role);
   const name = String((e && e.name) || '').trim();
   if (role === 'teacher') return 'teacher|' + name;
+  if (role === 'guest') return 'guest|' + name;
   const g = e && Number.isFinite(Number(e.grade)) ? Number(e.grade) : '';
   const c = e && Number.isFinite(Number(e.classNum)) ? Number(e.classNum) : '';
   return 'student|' + g + '|' + c + '|' + name;
