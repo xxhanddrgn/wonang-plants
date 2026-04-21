@@ -33,6 +33,16 @@ if (!fs.existsSync(GUESTBOOK_FILE)) {
   try { fs.writeFileSync(GUESTBOOK_FILE, '[]', 'utf-8'); } catch (e) {}
 }
 
+function dedupBoard(list) {
+  const bestByUser = new Map();
+  for (const e of list) {
+    const k = userKey(e);
+    const prev = bestByUser.get(k);
+    if (!prev || isBetter(e, prev)) bestByUser.set(k, e);
+  }
+  return Array.from(bestByUser.values());
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js':   'application/javascript; charset=utf-8',
@@ -96,6 +106,8 @@ function writeGuestbook(list) {
   return guestWriteChain;
 }
 
+const AUTHOR_KEY_RE = /^[a-zA-Z0-9_-]{8,64}$/;
+
 function validateGuestPost(body) {
   if (!body || typeof body !== 'object') return { errs: ['invalid body'] };
   const errs = [];
@@ -115,8 +127,10 @@ function validateGuestPost(body) {
   const message = String(body.message || '').replace(/\r\n/g, '\n').trim();
   if (!message) errs.push('message required');
   else if (message.length > MAX_MSG_LEN) errs.push('message too long');
+  const authorKey = body.authorKey == null ? '' : String(body.authorKey);
+  if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) errs.push('authorKey invalid');
   if (errs.length) return { errs };
-  return { errs, clean: { name, role, grade, classNum, message } };
+  return { errs, clean: { name, role, grade, classNum, message, authorKey: authorKey || null } };
 }
 
 function sendJSON(res, status, data) {
@@ -231,9 +245,36 @@ function genId() {
   return 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 }
 
+function userKey(e) {
+  const role = e && e.role === 'teacher' ? 'teacher' : 'student';
+  const name = String((e && e.name) || '').trim();
+  if (role === 'teacher') return 'teacher|' + name;
+  const g = e && Number.isFinite(Number(e.grade)) ? Number(e.grade) : '';
+  const c = e && Number.isFinite(Number(e.classNum)) ? Number(e.classNum) : '';
+  return 'student|' + g + '|' + c + '|' + name;
+}
+function isSameUser(a, b) { return userKey(a) === userKey(b); }
+function accuracyOf(e) {
+  const t = Number(e && e.total);
+  if (!Number.isFinite(t) || t <= 0) return 0;
+  const c = Number(e && e.correct) || 0;
+  return c / t;
+}
+function isBetter(a, b) {
+  const aa = accuracyOf(a), ab = accuracyOf(b);
+  if (aa !== ab) return aa > ab;
+  const ad = Number(a && a.durationMs), bd = Number(b && b.durationMs);
+  const af = Number.isFinite(ad) ? ad : Infinity;
+  const bf = Number.isFinite(bd) ? bd : Infinity;
+  if (af !== bf) return af < bf;
+  const at = Number(a && a.timestamp) || 0;
+  const bt = Number(b && b.timestamp) || 0;
+  return at < bt;
+}
+
 async function handleApi(req, res, url) {
   if (url === '/api/leaderboard' && req.method === 'GET') {
-    return sendJSON(res, 200, { list: readBoard() });
+    return sendJSON(res, 200, { list: dedupBoard(readBoard()) });
   }
   if (url === '/api/leaderboard' && req.method === 'POST') {
     const ip = getClientIp(req);
@@ -243,12 +284,31 @@ async function handleApi(req, res, url) {
     catch (e) { return sendJSON(res, 400, { error: e.message }); }
     const { errs, clean } = validateEntry(body);
     if (errs && errs.length) return sendJSON(res, 400, { error: '유효하지 않은 요청', details: errs });
-    const list = readBoard();
+    let list = readBoard();
     const entry = Object.assign({ id: genId(), timestamp: Date.now() }, clean);
-    list.push(entry);
+    const sameUserIdxs = [];
+    for (let i = 0; i < list.length; i++) {
+      if (isSameUser(list[i], entry)) sameUserIdxs.push(i);
+    }
+    let kept = entry;
+    if (sameUserIdxs.length) {
+      let bestIdx = sameUserIdxs[0];
+      for (const i of sameUserIdxs) if (isBetter(list[i], list[bestIdx])) bestIdx = i;
+      const prevBest = list[bestIdx];
+      list = list.filter((_, i) => !sameUserIdxs.includes(i));
+      if (isBetter(entry, prevBest)) {
+        list.push(entry);
+        kept = entry;
+      } else {
+        list.push(prevBest);
+        kept = prevBest;
+      }
+    } else {
+      list.push(entry);
+    }
     if (list.length > MAX_ENTRIES) list.splice(0, list.length - MAX_ENTRIES);
     await writeBoard(list);
-    return sendJSON(res, 201, { entry, list });
+    return sendJSON(res, 201, { entry: kept, submitted: entry, list });
   }
   if (url === '/api/leaderboard/clear' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -272,6 +332,50 @@ async function handleApi(req, res, url) {
     if (list.length > MAX_GUEST_ENTRIES) list.splice(0, list.length - MAX_GUEST_ENTRIES);
     await writeGuestbook(list);
     return sendJSON(res, 201, { entry, list });
+  }
+  if (url === '/api/guestbook/user-edit' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String(body && body.id || '');
+    const authorKey = String(body && body.authorKey || '');
+    const message = String(body && body.message || '').replace(/\r\n/g, '\n').trim();
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > MAX_MSG_LEN) return sendJSON(res, 400, { error: 'message too long' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+      return sendJSON(res, 403, { error: '본인이 작성한 방명록만 수정할 수 있어요.' });
+    }
+    list[idx].message = message;
+    list[idx].editedAt = Date.now();
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { entry: list[idx], list });
+  }
+  if (url === '/api/guestbook/user-delete' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String(body && body.id || '');
+    const authorKey = String(body && body.authorKey || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+      return sendJSON(res, 403, { error: '본인이 작성한 방명록만 삭제할 수 있어요.' });
+    }
+    list.splice(idx, 1);
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { ok: true, list });
   }
   if (url === '/api/guestbook/clear' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -374,6 +478,15 @@ const server = http.createServer((req, res) => {
   }
   serveStatic(req, res);
 });
+
+try {
+  const initial = readBoard();
+  const deduped = dedupBoard(initial);
+  if (deduped.length !== initial.length) {
+    writeBoard(deduped);
+    console.log(`leaderboard deduped on startup: ${initial.length} → ${deduped.length}`);
+  }
+} catch (e) { console.error('startup dedup failed', e); }
 
 server.listen(PORT, HOST, () => {
   console.log(`wonang-plants server listening on http://${HOST}:${PORT}`);
