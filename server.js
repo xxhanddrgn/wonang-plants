@@ -511,9 +511,37 @@ function serveStatic(req, res) {
     }
     const ext = path.extname(filePath).toLowerCase();
     const type = MIME[ext] || 'application/octet-stream';
+    const size = stat.size;
+    const cache = ext === '.html' ? 'no-cache' : 'public, max-age=3600';
+    const rangeHeader = req.headers['range'];
+    // Mobile Safari (and some Android builds) refuse to play <audio> from
+    // sources that don't honor Range requests. Support partial content
+    // for everything — cheap for non-audio files too.
+    if (rangeHeader) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+      if (m) {
+        let start = m[1] === '' ? 0 : parseInt(m[1], 10);
+        let end = m[2] === '' ? size - 1 : parseInt(m[2], 10);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || end >= size) {
+          res.writeHead(416, { 'Content-Range': `bytes */${size}`, 'Accept-Ranges': 'bytes' });
+          return res.end();
+        }
+        res.writeHead(206, {
+          'Content-Type': type,
+          'Content-Range': `bytes ${start}-${end}/${size}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': end - start + 1,
+          'Cache-Control': cache
+        });
+        if (req.method === 'HEAD') return res.end();
+        return fs.createReadStream(filePath, { start, end }).pipe(res);
+      }
+    }
     res.writeHead(200, {
       'Content-Type': type,
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
+      'Content-Length': size,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': cache
     });
     if (req.method === 'HEAD') return res.end();
     fs.createReadStream(filePath).pipe(res);
