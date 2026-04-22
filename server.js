@@ -394,6 +394,76 @@ async function handleApi(req, res, url) {
     await writeGuestbook(list);
     return sendJSON(res, 200, { ok: true, list });
   }
+  if (url === '/api/guestbook/comment' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String(body && body.postId || '');
+    if (!postId) return sendJSON(res, 400, { error: 'postId required' });
+    const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) return sendJSON(res, 400, { error: 'name required' });
+    const role = normalizeRole(body && body.role);
+    let grade = null, classNum = null;
+    if (role === 'student') {
+      grade = Math.floor(Number(body && body.grade));
+      classNum = Math.floor(Number(body && body.classNum));
+      const allowed = GRADE_CLASS_MAP[grade];
+      if (!allowed) return sendJSON(res, 400, { error: 'grade must be 1-6' });
+      if (!Number.isFinite(classNum) || !allowed.includes(classNum)) return sendJSON(res, 400, { error: 'classNum not allowed for this grade' });
+    }
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > 300) return sendJSON(res, 400, { error: 'message too long' });
+    const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
+    if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
+    const list = readGuestbook();
+    const idx = list.findIndex((e) => e.id === postId);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    const post = list[idx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    if (post.comments.length >= 500) return sendJSON(res, 400, { error: '댓글이 너무 많아요.' });
+    const comment = {
+      id: 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      timestamp: Date.now(),
+      name, role, grade, classNum, message,
+      authorKey: authorKey || null
+    };
+    post.comments.push(comment);
+    await writeGuestbook(list);
+    return sendJSON(res, 201, { comment, entry: post, list });
+  }
+  if (url === '/api/guestbook/comment/delete' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String(body && body.postId || '');
+    const commentId = String(body && body.commentId || '');
+    const authorKey = String(body && body.authorKey || '');
+    if (!postId || !commentId) return sendJSON(res, 400, { error: 'postId and commentId required' });
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+    const list = readGuestbook();
+    const pIdx = list.findIndex((e) => e.id === postId);
+    if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+    const post = list[pIdx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    const cIdx = post.comments.findIndex((c) => c.id === commentId);
+    if (cIdx === -1) return sendJSON(res, 404, { error: 'comment not found' });
+    const comment = post.comments[cIdx];
+    if (!isAdmin) {
+      if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+      if (!comment.authorKey || !timingSafeEq(comment.authorKey, authorKey)) {
+        return sendJSON(res, 403, { error: '본인이 작성한 댓글만 삭제할 수 있어요.' });
+      }
+    }
+    post.comments.splice(cIdx, 1);
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { ok: true, entry: post, list });
+  }
   if (url === '/api/guestbook/react' && req.method === 'POST') {
     const ip = getClientIp(req);
     if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
