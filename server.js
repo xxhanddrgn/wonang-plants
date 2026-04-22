@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -68,6 +69,51 @@ const MIME = {
 };
 const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.ogg', '.wav']);
 const AUDIO_DIR = path.join(ROOT, 'audio');
+
+const PDF_CACHE_DIR = path.join(DATA_DIR, 'pdf-cache');
+const PDF_GUIDE_FILE = path.join(PDF_CACHE_DIR, 'wonang-plant-guide.pdf');
+const PDF_GUIDE_SOURCE = 'https://github.com/xxhanddrgn/wonang-plants/releases/download/guide-v1/wonang-plant-guide.pdf';
+try { fs.mkdirSync(PDF_CACHE_DIR, { recursive: true }); } catch (_) {}
+
+let pdfCachePromise = null;
+function downloadFollow(url, destPath, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error('too many redirects'));
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 300 && code < 400 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return downloadFollow(next, destPath, redirects + 1).then(resolve, reject);
+      }
+      if (code !== 200) {
+        res.resume();
+        return reject(new Error('http ' + code));
+      }
+      const tmp = destPath + '.tmp';
+      const out = fs.createWriteStream(tmp);
+      res.pipe(out);
+      out.on('finish', () => out.close(() => fs.rename(tmp, destPath, (err) => err ? reject(err) : resolve())));
+      out.on('error', reject);
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => req.destroy(new Error('timeout')));
+  });
+}
+function ensurePdfGuideCached() {
+  if (fs.existsSync(PDF_GUIDE_FILE)) return Promise.resolve();
+  if (!pdfCachePromise) {
+    console.log('caching PDF guide from', PDF_GUIDE_SOURCE);
+    pdfCachePromise = downloadFollow(PDF_GUIDE_SOURCE, PDF_GUIDE_FILE)
+      .then(() => console.log('PDF guide cached at', PDF_GUIDE_FILE))
+      .catch((err) => { console.error('PDF cache failed', err); pdfCachePromise = null; throw err; });
+  }
+  return pdfCachePromise;
+}
+// Kick off the cache on startup so the first user request is fast.
+ensurePdfGuideCached().catch(() => {});
 
 function safeJoin(root, reqPath) {
   const decoded = decodeURIComponent(reqPath.split('?')[0]);
@@ -618,8 +664,57 @@ function serveStatic(req, res) {
   });
 }
 
+function servePdfGuide(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { 'Allow': 'GET, HEAD' });
+    return res.end('Method Not Allowed');
+  }
+  const reply = () => {
+    fs.stat(PDF_GUIDE_FILE, (err, stat) => {
+      if (err || !stat.isFile()) {
+        // Cache failed; redirect so the user still gets the file (will download).
+        res.writeHead(302, { Location: PDF_GUIDE_SOURCE });
+        return res.end();
+      }
+      const size = stat.size;
+      const baseHeaders = {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': 'inline; filename="wonang-plant-guide.pdf"',
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=3600'
+      };
+      const rangeHeader = req.headers['range'];
+      if (rangeHeader) {
+        const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+        if (m) {
+          let start = m[1] === '' ? 0 : parseInt(m[1], 10);
+          let end = m[2] === '' ? size - 1 : parseInt(m[2], 10);
+          if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || end >= size) {
+            res.writeHead(416, { 'Content-Range': `bytes */${size}`, 'Accept-Ranges': 'bytes' });
+            return res.end();
+          }
+          res.writeHead(206, Object.assign({}, baseHeaders, {
+            'Content-Range': `bytes ${start}-${end}/${size}`,
+            'Content-Length': end - start + 1
+          }));
+          if (req.method === 'HEAD') return res.end();
+          return fs.createReadStream(PDF_GUIDE_FILE, { start, end }).pipe(res);
+        }
+      }
+      res.writeHead(200, Object.assign({}, baseHeaders, { 'Content-Length': size }));
+      if (req.method === 'HEAD') return res.end();
+      fs.createReadStream(PDF_GUIDE_FILE).pipe(res);
+    });
+  };
+  if (fs.existsSync(PDF_GUIDE_FILE)) return reply();
+  ensurePdfGuideCached().then(reply, () => reply());
+}
+
 const server = http.createServer((req, res) => {
   const urlOnly = (req.url || '/').split('?')[0];
+  if (urlOnly === '/pdf/wonang-plant-guide.pdf') {
+    return servePdfGuide(req, res);
+  }
   if (urlOnly.startsWith('/api/')) {
     handleApi(req, res, urlOnly).catch((err) => {
       console.error('api error', err);
