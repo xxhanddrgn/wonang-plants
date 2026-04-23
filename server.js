@@ -407,14 +407,16 @@ async function handleApi(req, res, url) {
     const id = String(body && body.id || '');
     const authorKey = String(body && body.authorKey || '');
     const message = String(body && body.message || '').replace(/\r\n/g, '\n').trim();
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
     if (!id) return sendJSON(res, 400, { error: 'id required' });
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!isAdmin && (!authorKey || !AUTHOR_KEY_RE.test(authorKey))) return sendJSON(res, 400, { error: 'authorKey required' });
     if (!message) return sendJSON(res, 400, { error: 'message required' });
     if (message.length > MAX_MSG_LEN) return sendJSON(res, 400, { error: 'message too long' });
     const list = readGuestbook();
     const idx = list.findIndex((e) => e.id === id);
     if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
-    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+    if (!isAdmin && (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey))) {
       return sendJSON(res, 403, { error: '본인이 작성한 방명록만 수정할 수 있어요.' });
     }
     list[idx].message = message;
@@ -430,12 +432,14 @@ async function handleApi(req, res, url) {
     catch (e) { return sendJSON(res, 400, { error: e.message }); }
     const id = String(body && body.id || '');
     const authorKey = String(body && body.authorKey || '');
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
     if (!id) return sendJSON(res, 400, { error: 'id required' });
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!isAdmin && (!authorKey || !AUTHOR_KEY_RE.test(authorKey))) return sendJSON(res, 400, { error: 'authorKey required' });
     const list = readGuestbook();
     const idx = list.findIndex((e) => e.id === id);
     if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
-    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+    if (!isAdmin && (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey))) {
       return sendJSON(res, 403, { error: '본인이 작성한 방명록만 삭제할 수 있어요.' });
     }
     list.splice(idx, 1);
@@ -621,6 +625,34 @@ async function handleApi(req, res, url) {
   if (url === '/api/health' && req.method === 'GET') {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
+  if (url.startsWith('/api/notifications') && req.method === 'GET') {
+    let u;
+    try { u = new URL(url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
+    const authorKey = u.searchParams.get('authorKey') || '';
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    let comments = 0, reactions = 0;
+    const scanPost = (p) => {
+      if (p.authorKey !== authorKey) return;
+      if (Array.isArray(p.comments)) {
+        for (const c of p.comments) {
+          if (c.authorKey && c.authorKey !== authorKey) comments++;
+        }
+      }
+      if (p.reactions && typeof p.reactions === 'object') {
+        for (const key of Object.keys(p.reactions)) {
+          const arr = Array.isArray(p.reactions[key]) ? p.reactions[key] : [];
+          reactions += arr.filter((k) => k && k !== authorKey).length;
+        }
+      }
+    };
+    for (const type of Object.keys(POST_TYPES)) {
+      const list = readPostFile(type);
+      for (const p of list) scanPost(p);
+    }
+    const guest = readGuestbook();
+    for (const p of guest) scanPost(p);
+    return sendJSON(res, 200, { comments, reactions });
+  }
   return sendJSON(res, 404, { error: 'not found' });
 }
 
@@ -794,12 +826,14 @@ async function handlePostsApi(req, res, type, sub) {
     catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
     const id = String((body && body.id) || '');
     const authorKey = String((body && body.authorKey) || '');
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
     if (!id) return sendJSON(res, 400, { error: 'id required' });
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!isAdmin && (!authorKey || !AUTHOR_KEY_RE.test(authorKey))) return sendJSON(res, 400, { error: 'authorKey required' });
     const list = readPostFile(type);
     const idx = list.findIndex((e) => e.id === id);
     if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
-    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+    if (!isAdmin && (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey))) {
       return sendJSON(res, 403, { error: '본인이 작성한 글만 수정할 수 있어요.' });
     }
     // Apply the subset of fields the type allows. Always accept message; plus type extras that make sense to edit.
@@ -851,12 +885,14 @@ async function handlePostsApi(req, res, type, sub) {
     catch (e) { return sendJSON(res, 400, { error: e.message }); }
     const id = String((body && body.id) || '');
     const authorKey = String((body && body.authorKey) || '');
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
     if (!id) return sendJSON(res, 400, { error: 'id required' });
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!isAdmin && (!authorKey || !AUTHOR_KEY_RE.test(authorKey))) return sendJSON(res, 400, { error: 'authorKey required' });
     const list = readPostFile(type);
     const idx = list.findIndex((e) => e.id === id);
     if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
-    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+    if (!isAdmin && (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey))) {
       return sendJSON(res, 403, { error: '본인이 작성한 글만 삭제할 수 있어요.' });
     }
     list.splice(idx, 1);
