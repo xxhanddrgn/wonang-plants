@@ -165,7 +165,7 @@ function writeGuestbook(list) {
 
 const AUTHOR_KEY_RE = /^[a-zA-Z0-9_-]{8,64}$/;
 const REACTION_TYPES = ['heart', 'thumbs'];
-const VALID_ROLES = ['student', 'teacher', 'guest'];
+const VALID_ROLES = ['student', 'teacher', 'parent', 'guest'];
 function normalizeRole(r) {
   return VALID_ROLES.includes(r) ? r : 'student';
 }
@@ -312,6 +312,7 @@ function userKey(e) {
   const role = normalizeRole(e && e.role);
   const name = String((e && e.name) || '').trim();
   if (role === 'teacher') return 'teacher|' + name;
+  if (role === 'parent') return 'parent|' + name;
   if (role === 'guest') return 'guest|' + name;
   const g = e && Number.isFinite(Number(e.grade)) ? Number(e.grade) : '';
   const c = e && Number.isFinite(Number(e.classNum)) ? Number(e.classNum) : '';
