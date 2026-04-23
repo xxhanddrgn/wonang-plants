@@ -909,10 +909,19 @@ async function handlePostsApi(req, res, type, sub) {
     const post = list[idx];
     if (!Array.isArray(post.comments)) post.comments = [];
     if (post.comments.length >= 500) return sendJSON(res, 400, { error: '댓글이 너무 많아요.' });
+    let parentId = null;
+    const parentIdRaw = body && body.parentId;
+    if (parentIdRaw) {
+      const parent = post.comments.find((c) => c.id === parentIdRaw);
+      if (!parent) return sendJSON(res, 400, { error: 'parent comment not found' });
+      if (parent.parentId) return sendJSON(res, 400, { error: '답글은 한 단계까지만 가능해요.' });
+      parentId = parent.id;
+    }
     const comment = {
       id: 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
       timestamp: Date.now(),
       name, role, grade, classNum, message,
+      parentId,
       authorKey: authorKey || null
     };
     post.comments.push(comment);
