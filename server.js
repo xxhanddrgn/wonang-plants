@@ -610,6 +610,14 @@ async function handleApi(req, res, url) {
     if (!POST_TYPES[type]) return sendJSON(res, 404, { error: 'unknown post type' });
     return handlePostsApi(req, res, type, sub);
   }
+  // ==================== Mini-game leaderboards ====================
+  const gameMatch = /^\/api\/games\/([a-z]+)\/(leaderboard|score|leaderboard\/clear)$/.exec(url);
+  if (gameMatch) {
+    const gameType = gameMatch[1];
+    const sub = gameMatch[2];
+    if (!GAME_TYPES[gameType]) return sendJSON(res, 404, { error: 'unknown game type' });
+    return handleGameApi(req, res, gameType, sub);
+  }
   if (url === '/api/health' && req.method === 'GET') {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
@@ -1227,6 +1235,129 @@ try {
     console.log(`leaderboard deduped on startup: ${initial.length} → ${deduped.length}`);
   }
 } catch (e) { console.error('startup dedup failed', e); }
+
+// ==================== MINI-GAME LEADERBOARDS ====================
+const MAX_GAME_ENTRIES = 5000;
+const GAME_TYPES = {
+  memory:     { file: path.join(DATA_DIR, 'games-memory.json') },
+  wordsearch: { file: path.join(DATA_DIR, 'games-wordsearch.json') }
+};
+for (const t of Object.keys(GAME_TYPES)) {
+  const f = GAME_TYPES[t].file;
+  if (!fs.existsSync(f)) { try { fs.writeFileSync(f, '[]', 'utf-8'); } catch (_) {} }
+}
+const gameWriteChains = {};
+function readGameBoard(type) {
+  try {
+    const raw = fs.readFileSync(GAME_TYPES[type].file, 'utf-8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+function writeGameBoard(type, list) {
+  const f = GAME_TYPES[type].file;
+  gameWriteChains[type] = (gameWriteChains[type] || Promise.resolve()).then(() => new Promise((resolve, reject) => {
+    const tmp = f + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(list), 'utf-8', (err) => {
+      if (err) return reject(err);
+      fs.rename(tmp, f, (err2) => err2 ? reject(err2) : resolve());
+    });
+  })).catch((err) => { console.error('writeGameBoard ' + type + ' failed', err); });
+  return gameWriteChains[type];
+}
+function isGameBetter(a, b) {
+  if (!b) return true;
+  if (a.completed !== b.completed) return !!a.completed;
+  if (a.completed && b.completed) {
+    return (a.durationMs || 0) < (b.durationMs || 0);
+  }
+  // Both incomplete: more progress wins, then less time
+  const aProg = a.progress || 0, bProg = b.progress || 0;
+  if (aProg !== bProg) return aProg > bProg;
+  return (a.durationMs || 0) < (b.durationMs || 0);
+}
+function gameUserKey(e) {
+  const role = normalizeRole(e && e.role);
+  const name = String((e && e.name) || '').trim();
+  if (role === 'teacher') return 'teacher|' + name;
+  if (role === 'parent') return 'parent|' + name;
+  if (role === 'guest') return 'guest|' + name;
+  const g = e && Number.isFinite(Number(e.grade)) ? Number(e.grade) : '';
+  const c = e && Number.isFinite(Number(e.classNum)) ? Number(e.classNum) : '';
+  return 'student|' + g + '|' + c + '|' + name;
+}
+
+async function handleGameApi(req, res, gameType, sub) {
+  const ip = getClientIp(req);
+  if (sub === 'leaderboard' && req.method === 'GET') {
+    return sendJSON(res, 200, { list: readGameBoard(gameType) });
+  }
+  if (sub === 'leaderboard/clear' && req.method === 'POST') {
+    const adminHeader = req.headers['x-admin-token'] || '';
+    if (!ADMIN_TOKEN || !adminHeader || !timingSafeEq(adminHeader, ADMIN_TOKEN)) {
+      return sendJSON(res, 401, { error: '관리자 인증 필요' });
+    }
+    await writeGameBoard(gameType, []);
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (sub === 'score' && req.method === 'POST') {
+    if (!rateOk(ip)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const errs = [];
+    const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) errs.push('name required');
+    const role = normalizeRole(body && body.role);
+    let grade = null, classNum = null;
+    if (role === 'student') {
+      grade = Math.floor(Number(body && body.grade));
+      classNum = Math.floor(Number(body && body.classNum));
+      const allowed = GRADE_CLASS_MAP[grade];
+      if (!allowed) errs.push('grade must be 1-6');
+      else if (!Number.isFinite(classNum) || !allowed.includes(classNum)) errs.push('classNum not allowed for this grade');
+    }
+    const durationMs = Math.max(0, Math.min(60 * 60 * 1000, Math.floor(Number(body && body.durationMs) || 0)));
+    const completed = !!(body && body.completed);
+    const progress = Math.max(0, Math.min(1, Number(body && body.progress) || (completed ? 1 : 0)));
+    const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
+    if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) errs.push('authorKey invalid');
+    if (errs.length) return sendJSON(res, 400, { error: '유효하지 않은 요청', details: errs });
+
+    const entry = {
+      id: 'g_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      timestamp: Date.now(),
+      name, role, grade, classNum,
+      durationMs, completed, progress,
+      authorKey: authorKey || null
+    };
+    let list = readGameBoard(gameType);
+    const sameUserIdxs = [];
+    for (let i = 0; i < list.length; i++) {
+      if (gameUserKey(list[i]) === gameUserKey(entry)) sameUserIdxs.push(i);
+    }
+    let kept = entry;
+    if (sameUserIdxs.length) {
+      let bestIdx = sameUserIdxs[0];
+      for (const i of sameUserIdxs) if (isGameBetter(list[i], list[bestIdx])) bestIdx = i;
+      const prevBest = list[bestIdx];
+      list = list.filter((_, i) => !sameUserIdxs.includes(i));
+      if (isGameBetter(entry, prevBest)) {
+        list.push(entry);
+        kept = entry;
+      } else {
+        list.push(prevBest);
+        kept = prevBest;
+      }
+    } else {
+      list.push(entry);
+    }
+    if (list.length > MAX_GAME_ENTRIES) list.splice(0, list.length - MAX_GAME_ENTRIES);
+    await writeGameBoard(gameType, list);
+    return sendJSON(res, 201, { entry: kept, submitted: entry, list });
+  }
+  return sendJSON(res, 404, { error: 'not found' });
+}
 
 server.listen(PORT, HOST, () => {
   console.log(`wonang-plants server listening on http://${HOST}:${PORT}`);
