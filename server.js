@@ -673,7 +673,7 @@ function writePostFile(type, list) {
   return postWriteChains[type];
 }
 
-function validatePostCommon(body, { maxMsgLen }) {
+function validatePostCommon(body, { maxMsgLen, messageRequired = true }) {
   const errs = [];
   const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
   if (!name) errs.push('name required');
@@ -687,7 +687,7 @@ function validatePostCommon(body, { maxMsgLen }) {
     else if (!Number.isFinite(classNum) || !allowed.includes(classNum)) errs.push('classNum not allowed for this grade');
   }
   const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
-  if (!message) errs.push('message required');
+  if (messageRequired && !message) errs.push('message required');
   else if (message.length > maxMsgLen) errs.push('message too long');
   const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
   if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) errs.push('authorKey invalid');
@@ -744,7 +744,8 @@ function validateNatureExtras(body) {
 
 function validatePost(type, body) {
   const cfg = POST_TYPES[type];
-  const base = validatePostCommon(body, { maxMsgLen: cfg.maxMsgLen });
+  const messageRequired = type !== 'qa';
+  const base = validatePostCommon(body, { maxMsgLen: cfg.maxMsgLen, messageRequired });
   if (base.errs.length) return base;
   let extra = { errs: [], clean: {} };
   if (type === 'student') extra = validateStudentExtras(body);
@@ -804,7 +805,7 @@ async function handlePostsApi(req, res, type, sub) {
     }
     // Apply the subset of fields the type allows. Always accept message; plus type extras that make sense to edit.
     const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
-    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (type !== 'qa' && !message) return sendJSON(res, 400, { error: 'message required' });
     if (message.length > cfg.maxMsgLen) return sendJSON(res, 400, { error: 'message too long' });
     list[idx].message = message;
     if (type === 'student') {
