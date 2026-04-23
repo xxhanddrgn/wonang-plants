@@ -204,13 +204,14 @@ function sendJSON(res, status, data) {
   res.end(body);
 }
 
-function readJSONBody(req) {
+function readJSONBody(req, max) {
+  const limit = Number.isFinite(max) && max > 0 ? max : MAX_BODY_BYTES;
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > limit) {
         reject(new Error('body too large'));
         req.destroy();
         return;
@@ -600,8 +601,460 @@ async function handleApi(req, res, url) {
     } catch (_) { /* directory may not exist yet */ }
     return sendJSON(res, 200, { files });
   }
+  // ==================== Generic posts (student / qa / nature) ====================
+  const postsMatch = /^\/api\/posts\/([a-z]+)(?:\/(.*))?$/.exec(url);
+  if (postsMatch) {
+    const type = postsMatch[1];
+    const sub = postsMatch[2] || '';
+    if (!POST_TYPES[type]) return sendJSON(res, 404, { error: 'unknown post type' });
+    return handlePostsApi(req, res, type, sub);
+  }
   if (url === '/api/health' && req.method === 'GET') {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
+  }
+  return sendJSON(res, 404, { error: 'not found' });
+}
+
+// ==================== POSTS CONTENT TYPES ====================
+const MAX_PHOTO_BODY = 1_200_000;   // ~1.15 MB, fits 500KB base64 JPEG + overhead
+const MAX_POSTS_ENTRIES = 2000;
+const POST_TYPES = {
+  student: {
+    file: path.join(DATA_DIR, 'posts-student.json'),
+    extras: ['location', 'photo'],
+    maxMsgLen: 500,
+    hasPhoto: true
+  },
+  qa: {
+    file: path.join(DATA_DIR, 'posts-qa.json'),
+    extras: ['title'],
+    maxMsgLen: 2000,
+    hasAnswers: true
+  },
+  nature: {
+    file: path.join(DATA_DIR, 'posts-nature.json'),
+    extras: ['title', 'origin', 'source'],
+    maxMsgLen: 2000
+  }
+};
+// Ensure each data file exists as []
+for (const t of Object.keys(POST_TYPES)) {
+  const f = POST_TYPES[t].file;
+  if (!fs.existsSync(f)) { try { fs.writeFileSync(f, '[]', 'utf-8'); } catch (_) {} }
+}
+const postWriteChains = {};
+function readPostFile(type) {
+  try {
+    const raw = fs.readFileSync(POST_TYPES[type].file, 'utf-8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+function writePostFile(type, list) {
+  const f = POST_TYPES[type].file;
+  postWriteChains[type] = (postWriteChains[type] || Promise.resolve()).then(() => new Promise((resolve, reject) => {
+    const tmp = f + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(list), 'utf-8', (err) => {
+      if (err) return reject(err);
+      fs.rename(tmp, f, (err2) => err2 ? reject(err2) : resolve());
+    });
+  })).catch((err) => { console.error('writePostFile ' + type + ' failed', err); });
+  return postWriteChains[type];
+}
+
+function validatePostCommon(body, { maxMsgLen }) {
+  const errs = [];
+  const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+  if (!name) errs.push('name required');
+  const role = normalizeRole(body && body.role);
+  let grade = null, classNum = null;
+  if (role === 'student') {
+    grade = Math.floor(Number(body && body.grade));
+    classNum = Math.floor(Number(body && body.classNum));
+    const allowed = GRADE_CLASS_MAP[grade];
+    if (!allowed) errs.push('grade must be 1-6');
+    else if (!Number.isFinite(classNum) || !allowed.includes(classNum)) errs.push('classNum not allowed for this grade');
+  }
+  const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+  if (!message) errs.push('message required');
+  else if (message.length > maxMsgLen) errs.push('message too long');
+  const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
+  if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) errs.push('authorKey invalid');
+  return { errs, clean: { name, role, grade, classNum, message, authorKey: authorKey || null } };
+}
+
+function validateStudentExtras(body) {
+  const errs = [];
+  const location = body && body.location === 'offsite' ? 'offsite' : 'onsite';
+  const photo = typeof (body && body.photo) === 'string' ? body.photo : '';
+  if (!photo) errs.push('photo required');
+  else if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo)) errs.push('photo invalid');
+  else if (photo.length > 900000) errs.push('photo too large'); // ~675KB raw max
+  return { errs, clean: { location, photo } };
+}
+function validateQaExtras(body) {
+  const errs = [];
+  const title = String((body && body.title) || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+  if (!title) errs.push('title required');
+  return { errs, clean: { title } };
+}
+function validateNatureExtras(body) {
+  const errs = [];
+  const title = String((body && body.title) || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+  if (!title) errs.push('title required');
+  const origin = body && body.origin === 'quoted' ? 'quoted' : 'self';
+  let source = null;
+  if (origin === 'quoted') {
+    source = String((body && body.source) || '').trim().slice(0, 120);
+    if (!source) errs.push('source required for quoted');
+  }
+  return { errs, clean: { title, origin, source } };
+}
+
+function validatePost(type, body) {
+  const cfg = POST_TYPES[type];
+  const base = validatePostCommon(body, { maxMsgLen: cfg.maxMsgLen });
+  if (base.errs.length) return base;
+  let extra = { errs: [], clean: {} };
+  if (type === 'student') extra = validateStudentExtras(body);
+  else if (type === 'qa') extra = validateQaExtras(body);
+  else if (type === 'nature') extra = validateNatureExtras(body);
+  if (extra.errs.length) return { errs: extra.errs };
+  return { errs: [], clean: Object.assign({}, base.clean, extra.clean) };
+}
+
+function genPostId(type) {
+  return type[0] + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+async function handlePostsApi(req, res, type, sub) {
+  const cfg = POST_TYPES[type];
+  const ip = getClientIp(req);
+  const bodyLimit = cfg.hasPhoto ? MAX_PHOTO_BODY : MAX_BODY_BYTES;
+
+  // GET /api/posts/:type
+  if (sub === '' && req.method === 'GET') {
+    return sendJSON(res, 200, { list: readPostFile(type) });
+  }
+  // POST /api/posts/:type  (create)
+  if (sub === '' && req.method === 'POST') {
+    if (!rateOk(ip)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
+    let body;
+    try { body = await readJSONBody(req, bodyLimit); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
+    const { errs, clean } = validatePost(type, body);
+    if (errs && errs.length) return sendJSON(res, 400, { error: '유효하지 않은 요청', details: errs });
+    const list = readPostFile(type);
+    const entry = Object.assign({
+      id: genPostId(type), timestamp: Date.now(),
+      reactions: {}, comments: []
+    }, clean);
+    if (cfg.hasAnswers) entry.answers = [];
+    list.push(entry);
+    if (list.length > MAX_POSTS_ENTRIES) list.splice(0, list.length - MAX_POSTS_ENTRIES);
+    await writePostFile(type, list);
+    return sendJSON(res, 201, { entry, list });
+  }
+  // POST /api/posts/:type/user-edit
+  if (sub === 'user-edit' && req.method === 'POST') {
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req, bodyLimit); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
+    const id = String((body && body.id) || '');
+    const authorKey = String((body && body.authorKey) || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+      return sendJSON(res, 403, { error: '본인이 작성한 글만 수정할 수 있어요.' });
+    }
+    // Apply the subset of fields the type allows. Always accept message; plus type extras that make sense to edit.
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > cfg.maxMsgLen) return sendJSON(res, 400, { error: 'message too long' });
+    list[idx].message = message;
+    if (type === 'student') {
+      if (body && body.location) list[idx].location = body.location === 'offsite' ? 'offsite' : 'onsite';
+      if (typeof (body && body.photo) === 'string' && body.photo) {
+        if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(body.photo) || body.photo.length > 900000) {
+          return sendJSON(res, 400, { error: 'photo invalid' });
+        }
+        list[idx].photo = body.photo;
+      }
+    } else if (type === 'qa' || type === 'nature') {
+      if (body && typeof body.title === 'string') {
+        const t = body.title.trim().replace(/\s+/g, ' ').slice(0, 100);
+        if (t) list[idx].title = t;
+      }
+      if (type === 'nature') {
+        if (body && body.origin === 'self') { list[idx].origin = 'self'; list[idx].source = null; }
+        else if (body && body.origin === 'quoted') {
+          list[idx].origin = 'quoted';
+          const src = String((body && body.source) || '').trim().slice(0, 120);
+          if (!src) return sendJSON(res, 400, { error: 'source required for quoted' });
+          list[idx].source = src;
+        }
+      }
+    }
+    list[idx].editedAt = Date.now();
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { entry: list[idx], list });
+  }
+  // POST /api/posts/:type/user-delete
+  if (sub === 'user-delete' && req.method === 'POST') {
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String((body && body.id) || '');
+    const authorKey = String((body && body.authorKey) || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    if (!list[idx].authorKey || !timingSafeEq(list[idx].authorKey, authorKey)) {
+      return sendJSON(res, 403, { error: '본인이 작성한 글만 삭제할 수 있어요.' });
+    }
+    list.splice(idx, 1);
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { ok: true, list });
+  }
+  // POST /api/posts/:type/react
+  if (sub === 'react' && req.method === 'POST') {
+    if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String((body && body.id) || '');
+    const authorKey = String((body && body.authorKey) || '');
+    const reaction = String((body && body.reaction) || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (!REACTION_TYPES.includes(reaction)) return sendJSON(res, 400, { error: 'reaction invalid' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    const post = list[idx];
+    if (!post.reactions || typeof post.reactions !== 'object') post.reactions = {};
+    const bucket = Array.isArray(post.reactions[reaction]) ? post.reactions[reaction] : [];
+    const pos = bucket.indexOf(authorKey);
+    if (pos === -1) bucket.push(authorKey);
+    else bucket.splice(pos, 1);
+    post.reactions[reaction] = bucket;
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { entry: post, list });
+  }
+  // POST /api/posts/:type/comment
+  if (sub === 'comment' && req.method === 'POST') {
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String((body && body.postId) || '');
+    if (!postId) return sendJSON(res, 400, { error: 'postId required' });
+    const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) return sendJSON(res, 400, { error: 'name required' });
+    const role = normalizeRole(body && body.role);
+    let grade = null, classNum = null;
+    if (role === 'student') {
+      grade = Math.floor(Number(body && body.grade));
+      classNum = Math.floor(Number(body && body.classNum));
+      const allowed = GRADE_CLASS_MAP[grade];
+      if (!allowed) return sendJSON(res, 400, { error: 'grade must be 1-6' });
+      if (!Number.isFinite(classNum) || !allowed.includes(classNum)) return sendJSON(res, 400, { error: 'classNum not allowed for this grade' });
+    }
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > 300) return sendJSON(res, 400, { error: 'message too long' });
+    const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
+    if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === postId);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    const post = list[idx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    if (post.comments.length >= 500) return sendJSON(res, 400, { error: '댓글이 너무 많아요.' });
+    const comment = {
+      id: 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      timestamp: Date.now(),
+      name, role, grade, classNum, message,
+      authorKey: authorKey || null
+    };
+    post.comments.push(comment);
+    await writePostFile(type, list);
+    return sendJSON(res, 201, { comment, entry: post, list });
+  }
+  // POST /api/posts/:type/comment/delete
+  if (sub === 'comment/delete' && req.method === 'POST') {
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String((body && body.postId) || '');
+    const commentId = String((body && body.commentId) || '');
+    const authorKey = String((body && body.authorKey) || '');
+    if (!postId || !commentId) return sendJSON(res, 400, { error: 'postId and commentId required' });
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+    const list = readPostFile(type);
+    const pIdx = list.findIndex((e) => e.id === postId);
+    if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+    const post = list[pIdx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    const cIdx = post.comments.findIndex((c) => c.id === commentId);
+    if (cIdx === -1) return sendJSON(res, 404, { error: 'comment not found' });
+    const comment = post.comments[cIdx];
+    if (!isAdmin) {
+      if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+      if (!comment.authorKey || !timingSafeEq(comment.authorKey, authorKey)) {
+        return sendJSON(res, 403, { error: '본인이 작성한 댓글만 삭제할 수 있어요.' });
+      }
+    }
+    post.comments.splice(cIdx, 1);
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { ok: true, entry: post, list });
+  }
+  // Admin: edit / delete / clear
+  if (sub === 'edit' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req, bodyLimit); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
+    const id = String((body && body.id) || '');
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > cfg.maxMsgLen) return sendJSON(res, 400, { error: 'message too long' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    list[idx].message = message;
+    list[idx].editedAt = Date.now();
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { entry: list[idx], list });
+  }
+  if (sub === 'delete' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const id = String((body && body.id) || '');
+    if (!id) return sendJSON(res, 400, { error: 'id required' });
+    const list = readPostFile(type);
+    const idx = list.findIndex((e) => e.id === id);
+    if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
+    list.splice(idx, 1);
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { ok: true, list });
+  }
+  if (sub === 'clear' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    await writePostFile(type, []);
+    return sendJSON(res, 200, { ok: true });
+  }
+  // Q&A answer system
+  if (type === 'qa' && cfg.hasAnswers) {
+    if (sub === 'answer' && req.method === 'POST') {
+      if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+      let body;
+      try { body = await readJSONBody(req); }
+      catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      const postId = String((body && body.postId) || '');
+      if (!postId) return sendJSON(res, 400, { error: 'postId required' });
+      const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      if (!name) return sendJSON(res, 400, { error: 'name required' });
+      const role = normalizeRole(body && body.role);
+      let grade = null, classNum = null;
+      if (role === 'student') {
+        grade = Math.floor(Number(body && body.grade));
+        classNum = Math.floor(Number(body && body.classNum));
+        const allowed = GRADE_CLASS_MAP[grade];
+        if (!allowed) return sendJSON(res, 400, { error: 'grade must be 1-6' });
+        if (!Number.isFinite(classNum) || !allowed.includes(classNum)) return sendJSON(res, 400, { error: 'classNum not allowed for this grade' });
+      }
+      const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+      if (!message) return sendJSON(res, 400, { error: 'message required' });
+      if (message.length > 2000) return sendJSON(res, 400, { error: 'message too long' });
+      const authorKey = body && body.authorKey == null ? '' : String(body.authorKey);
+      if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
+      const list = readPostFile('qa');
+      const pIdx = list.findIndex((e) => e.id === postId);
+      if (pIdx === -1) return sendJSON(res, 404, { error: 'not found' });
+      const post = list[pIdx];
+      if (!Array.isArray(post.answers)) post.answers = [];
+      if (post.answers.length >= 200) return sendJSON(res, 400, { error: '답변이 너무 많아요.' });
+      const answer = {
+        id: 'a_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+        timestamp: Date.now(),
+        name, role, grade, classNum, message,
+        authorKey: authorKey || null,
+        reactions: {}
+      };
+      post.answers.push(answer);
+      await writePostFile('qa', list);
+      return sendJSON(res, 201, { answer, entry: post, list });
+    }
+    if (sub === 'answer/delete' && req.method === 'POST') {
+      if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+      let body;
+      try { body = await readJSONBody(req); }
+      catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      const postId = String((body && body.postId) || '');
+      const answerId = String((body && body.answerId) || '');
+      const authorKey = String((body && body.authorKey) || '');
+      if (!postId || !answerId) return sendJSON(res, 400, { error: 'postId and answerId required' });
+      const adminHeader = req.headers['x-admin-token'] || '';
+      const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+      const list = readPostFile('qa');
+      const pIdx = list.findIndex((e) => e.id === postId);
+      if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+      const post = list[pIdx];
+      if (!Array.isArray(post.answers)) post.answers = [];
+      const aIdx = post.answers.findIndex((a) => a.id === answerId);
+      if (aIdx === -1) return sendJSON(res, 404, { error: 'answer not found' });
+      const ans = post.answers[aIdx];
+      if (!isAdmin) {
+        if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+        if (!ans.authorKey || !timingSafeEq(ans.authorKey, authorKey)) {
+          return sendJSON(res, 403, { error: '본인이 작성한 답변만 삭제할 수 있어요.' });
+        }
+      }
+      post.answers.splice(aIdx, 1);
+      await writePostFile('qa', list);
+      return sendJSON(res, 200, { ok: true, entry: post, list });
+    }
+    if (sub === 'answer/react' && req.method === 'POST') {
+      if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+      let body;
+      try { body = await readJSONBody(req); }
+      catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      const postId = String((body && body.postId) || '');
+      const answerId = String((body && body.answerId) || '');
+      const authorKey = String((body && body.authorKey) || '');
+      const reaction = String((body && body.reaction) || '');
+      if (!postId || !answerId) return sendJSON(res, 400, { error: 'postId and answerId required' });
+      if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+      if (!REACTION_TYPES.includes(reaction)) return sendJSON(res, 400, { error: 'reaction invalid' });
+      const list = readPostFile('qa');
+      const pIdx = list.findIndex((e) => e.id === postId);
+      if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+      const post = list[pIdx];
+      if (!Array.isArray(post.answers)) post.answers = [];
+      const ans = post.answers.find((a) => a.id === answerId);
+      if (!ans) return sendJSON(res, 404, { error: 'answer not found' });
+      if (!ans.reactions || typeof ans.reactions !== 'object') ans.reactions = {};
+      const bucket = Array.isArray(ans.reactions[reaction]) ? ans.reactions[reaction] : [];
+      const pos = bucket.indexOf(authorKey);
+      if (pos === -1) bucket.push(authorKey);
+      else bucket.splice(pos, 1);
+      ans.reactions[reaction] = bucket;
+      await writePostFile('qa', list);
+      return sendJSON(res, 200, { entry: post, list });
+    }
   }
   return sendJSON(res, 404, { error: 'not found' });
 }
