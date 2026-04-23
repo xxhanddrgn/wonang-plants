@@ -627,9 +627,10 @@ const POST_TYPES = {
   },
   qa: {
     file: path.join(DATA_DIR, 'posts-qa.json'),
-    extras: ['title'],
+    extras: ['title', 'photo'],
     maxMsgLen: 2000,
-    hasAnswers: true
+    hasAnswers: true,
+    hasOptionalPhoto: true
   },
   nature: {
     file: path.join(DATA_DIR, 'posts-nature.json'),
@@ -696,7 +697,14 @@ function validateQaExtras(body) {
   const errs = [];
   const title = String((body && body.title) || '').trim().replace(/\s+/g, ' ').slice(0, 100);
   if (!title) errs.push('title required');
-  return { errs, clean: { title } };
+  const photoRaw = typeof (body && body.photo) === 'string' ? body.photo : '';
+  let photo = null;
+  if (photoRaw) {
+    if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photoRaw)) errs.push('photo invalid');
+    else if (photoRaw.length > 900000) errs.push('photo too large');
+    else photo = photoRaw;
+  }
+  return { errs, clean: { title, photo } };
 }
 function validateNatureExtras(body) {
   const errs = [];
@@ -730,7 +738,7 @@ function genPostId(type) {
 async function handlePostsApi(req, res, type, sub) {
   const cfg = POST_TYPES[type];
   const ip = getClientIp(req);
-  const bodyLimit = cfg.hasPhoto ? MAX_PHOTO_BODY : MAX_BODY_BYTES;
+  const bodyLimit = (cfg.hasPhoto || cfg.hasOptionalPhoto) ? MAX_PHOTO_BODY : MAX_BODY_BYTES;
 
   // GET /api/posts/:type
   if (sub === '' && req.method === 'GET') {
