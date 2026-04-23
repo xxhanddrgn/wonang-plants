@@ -621,9 +621,10 @@ const MAX_POSTS_ENTRIES = 2000;
 const POST_TYPES = {
   student: {
     file: path.join(DATA_DIR, 'posts-student.json'),
-    extras: ['location', 'photo'],
+    extras: ['location', 'title', 'photos'],
     maxMsgLen: 500,
-    hasPhoto: true
+    hasPhoto: true,
+    photoBodyLimit: 3_800_000
   },
   qa: {
     file: path.join(DATA_DIR, 'posts-qa.json'),
@@ -686,12 +687,25 @@ function validatePostCommon(body, { maxMsgLen }) {
 
 function validateStudentExtras(body) {
   const errs = [];
+  const title = String((body && body.title) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+  if (!title) errs.push('title required');
   const location = body && body.location === 'offsite' ? 'offsite' : 'onsite';
-  const photo = typeof (body && body.photo) === 'string' ? body.photo : '';
-  if (!photo) errs.push('photo required');
-  else if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo)) errs.push('photo invalid');
-  else if (photo.length > 900000) errs.push('photo too large'); // ~675KB raw max
-  return { errs, clean: { location, photo } };
+  const photosRaw = body && body.photos;
+  const photos = [];
+  if (!Array.isArray(photosRaw) || photosRaw.length === 0) {
+    errs.push('at least 1 photo required');
+  } else if (photosRaw.length > 3) {
+    errs.push('max 3 photos');
+  } else {
+    for (const p of photosRaw) {
+      if (typeof p !== 'string' || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p)) {
+        errs.push('photo invalid'); break;
+      }
+      if (p.length > 900000) { errs.push('photo too large'); break; }
+      photos.push(p);
+    }
+  }
+  return { errs, clean: { location, title, photos } };
 }
 function validateQaExtras(body) {
   const errs = [];
@@ -738,7 +752,7 @@ function genPostId(type) {
 async function handlePostsApi(req, res, type, sub) {
   const cfg = POST_TYPES[type];
   const ip = getClientIp(req);
-  const bodyLimit = (cfg.hasPhoto || cfg.hasOptionalPhoto) ? MAX_PHOTO_BODY : MAX_BODY_BYTES;
+  const bodyLimit = cfg.photoBodyLimit || ((cfg.hasPhoto || cfg.hasOptionalPhoto) ? MAX_PHOTO_BODY : MAX_BODY_BYTES);
 
   // GET /api/posts/:type
   if (sub === '' && req.method === 'GET') {
@@ -786,11 +800,20 @@ async function handlePostsApi(req, res, type, sub) {
     list[idx].message = message;
     if (type === 'student') {
       if (body && body.location) list[idx].location = body.location === 'offsite' ? 'offsite' : 'onsite';
-      if (typeof (body && body.photo) === 'string' && body.photo) {
-        if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(body.photo) || body.photo.length > 900000) {
-          return sendJSON(res, 400, { error: 'photo invalid' });
+      if (body && typeof body.title === 'string') {
+        const t = body.title.trim().replace(/\s+/g, ' ').slice(0, 40);
+        if (t) list[idx].title = t;
+      }
+      if (Array.isArray(body && body.photos)) {
+        if (body.photos.length === 0 || body.photos.length > 3) {
+          return sendJSON(res, 400, { error: 'photos must have 1-3 items' });
         }
-        list[idx].photo = body.photo;
+        for (const p of body.photos) {
+          if (typeof p !== 'string' || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p) || p.length > 900000) {
+            return sendJSON(res, 400, { error: 'photo invalid' });
+          }
+        }
+        list[idx].photos = body.photos.slice();
       }
     } else if (type === 'qa' || type === 'nature') {
       if (body && typeof body.title === 'string') {
