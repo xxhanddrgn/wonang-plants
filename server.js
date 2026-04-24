@@ -631,17 +631,34 @@ async function handleApi(req, res, url) {
     const authorKey = u.searchParams.get('authorKey') || '';
     if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
     let comments = 0, reactions = 0;
+    const countReactionsBy = (obj) => {
+      if (!obj || typeof obj !== 'object') return 0;
+      let n = 0;
+      for (const key of Object.keys(obj)) {
+        const arr = Array.isArray(obj[key]) ? obj[key] : [];
+        n += arr.filter((k) => k && k !== authorKey).length;
+      }
+      return n;
+    };
     const scanPost = (p) => {
-      if (p.authorKey !== authorKey) return;
-      if (Array.isArray(p.comments)) {
-        for (const c of p.comments) {
-          if (c.authorKey && c.authorKey !== authorKey) comments++;
+      if (p.authorKey === authorKey) {
+        if (Array.isArray(p.comments)) {
+          for (const c of p.comments) {
+            if (c.authorKey && c.authorKey !== authorKey) comments++;
+          }
+        }
+        reactions += countReactionsBy(p.reactions);
+        // Answers on my question count as engagement
+        if (Array.isArray(p.answers)) {
+          for (const a of p.answers) {
+            if (a.authorKey && a.authorKey !== authorKey) comments++;
+          }
         }
       }
-      if (p.reactions && typeof p.reactions === 'object') {
-        for (const key of Object.keys(p.reactions)) {
-          const arr = Array.isArray(p.reactions[key]) ? p.reactions[key] : [];
-          reactions += arr.filter((k) => k && k !== authorKey).length;
+      // Reactions on my answers (even on others' posts)
+      if (Array.isArray(p.answers)) {
+        for (const a of p.answers) {
+          if (a.authorKey === authorKey) reactions += countReactionsBy(a.reactions);
         }
       }
     };
