@@ -693,8 +693,10 @@ const POST_TYPES = {
   },
   nature: {
     file: path.join(DATA_DIR, 'posts-nature.json'),
-    extras: ['title', 'origin', 'source'],
-    maxMsgLen: 2000
+    extras: ['title', 'origin', 'source', 'photos'],
+    maxMsgLen: 2000,
+    hasOptionalPhotos: true,
+    photoBodyLimit: 3_800_000
   }
 };
 // Ensure each data file exists as []
@@ -788,7 +790,21 @@ function validateNatureExtras(body) {
     source = String((body && body.source) || '').trim().slice(0, 120);
     if (!source) errs.push('source required for quoted');
   }
-  return { errs, clean: { title, origin, source } };
+  const photosRaw = body && body.photos;
+  const photos = [];
+  if (Array.isArray(photosRaw)) {
+    if (photosRaw.length > 3) errs.push('max 3 photos');
+    else {
+      for (const p of photosRaw) {
+        if (typeof p !== 'string' || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p)) {
+          errs.push('photo invalid'); break;
+        }
+        if (p.length > 900000) { errs.push('photo too large'); break; }
+        photos.push(p);
+      }
+    }
+  }
+  return { errs, clean: { title, origin, source, photos } };
 }
 
 function validatePost(type, body) {
@@ -810,7 +826,7 @@ function genPostId(type) {
 async function handlePostsApi(req, res, type, sub) {
   const cfg = POST_TYPES[type];
   const ip = getClientIp(req);
-  const bodyLimit = cfg.photoBodyLimit || ((cfg.hasPhoto || cfg.hasOptionalPhoto) ? MAX_PHOTO_BODY : MAX_BODY_BYTES);
+  const bodyLimit = cfg.photoBodyLimit || ((cfg.hasPhoto || cfg.hasOptionalPhoto || cfg.hasOptionalPhotos) ? MAX_PHOTO_BODY : MAX_BODY_BYTES);
 
   // GET /api/posts/:type
   if (sub === '' && req.method === 'GET') {
@@ -887,6 +903,17 @@ async function handlePostsApi(req, res, type, sub) {
           const src = String((body && body.source) || '').trim().slice(0, 120);
           if (!src) return sendJSON(res, 400, { error: 'source required for quoted' });
           list[idx].source = src;
+        }
+        if (Array.isArray(body && body.photos)) {
+          if (body.photos.length > 3) {
+            return sendJSON(res, 400, { error: 'photos must be 0-3 items' });
+          }
+          for (const p of body.photos) {
+            if (typeof p !== 'string' || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p) || p.length > 900000) {
+              return sendJSON(res, 400, { error: 'photo invalid' });
+            }
+          }
+          list[idx].photos = body.photos.slice();
         }
       }
     }
