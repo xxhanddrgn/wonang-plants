@@ -677,7 +677,29 @@ async function handleApi(req, res, url) {
     let u;
     try { u = new URL(req.url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
     const authorKey = u.searchParams.get('authorKey') || '';
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    const nameParam = (u.searchParams.get('name') || '').trim();
+    const roleParam = (u.searchParams.get('role') || '').trim();
+    const gradeParam = u.searchParams.get('grade') || '';
+    const classParam = u.searchParams.get('classNum') || '';
+    if ((!authorKey || !AUTHOR_KEY_RE.test(authorKey)) && !nameParam) {
+      return sendJSON(res, 400, { error: 'authorKey or name required' });
+    }
+    // Identifies a post / comment / answer as belonging to the current user.
+    // authorKey is per-browser, so also accept a match on (name + role + grade + classNum)
+    // so posts created from another device or before a storage reset are still recognised.
+    const isMine = (obj) => {
+      if (!obj) return false;
+      if (authorKey && obj.authorKey === authorKey) return true;
+      if (nameParam && obj.name === nameParam) {
+        const objRole = obj.role || '';
+        if (roleParam && objRole !== roleParam) return false;
+        if (roleParam === 'student') {
+          return String(obj.grade || '') === gradeParam && String(obj.classNum || '') === classParam;
+        }
+        return true;
+      }
+      return false;
+    };
     const countUniqueReactors = (obj) => {
       if (!obj || typeof obj !== 'object') return 0;
       const reactors = new Set();
@@ -685,7 +707,7 @@ async function handleApi(req, res, url) {
         const arr = Array.isArray(obj[key]) ? obj[key] : [];
         for (const k of arr) {
           if (!k) continue;
-          if (k === authorKey) continue;
+          if (authorKey && k === authorKey) continue;
           reactors.add(k);
         }
       }
@@ -699,16 +721,16 @@ async function handleApi(req, res, url) {
     };
     const myPosts = [];
     const collect = (board, boardLabel, p) => {
-      if (p.authorKey !== authorKey) return;
+      if (!isMine(p)) return;
       const reactionCount = countUniqueReactors(p.reactions);
       const comments = Array.isArray(p.comments)
-        ? p.comments.filter((c) => c && c.authorKey !== authorKey).map((c) => ({
+        ? p.comments.filter((c) => c && !isMine(c)).map((c) => ({
             id: c.id, name: c.name, role: c.role, grade: c.grade, classNum: c.classNum,
             message: (c.message || '').slice(0, 200), timestamp: c.timestamp || 0
           }))
         : [];
       const answers = Array.isArray(p.answers)
-        ? p.answers.filter((a) => a && a.authorKey !== authorKey).map((a) => ({
+        ? p.answers.filter((a) => a && !isMine(a)).map((a) => ({
             id: a.id, name: a.name, role: a.role, grade: a.grade, classNum: a.classNum,
             message: (a.message || '').slice(0, 200), timestamp: a.timestamp || 0
           }))
