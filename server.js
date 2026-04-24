@@ -626,39 +626,40 @@ async function handleApi(req, res, url) {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
   if (url.startsWith('/api/notifications') && req.method === 'GET') {
+    // The client supplies its device authorKey so we can dedupe self-actions,
+    // but we intentionally count every interaction on every board regardless
+    // of who authored the parent post. This way every user on every corner
+    // of the site gets bell alerts for new likes, comments, and answers.
     let u;
     try { u = new URL(url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
     const authorKey = u.searchParams.get('authorKey') || '';
-    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
     let comments = 0, reactions = 0;
-    const countReactionsBy = (obj) => {
+    const countReactions = (obj) => {
       if (!obj || typeof obj !== 'object') return 0;
       let n = 0;
       for (const key of Object.keys(obj)) {
         const arr = Array.isArray(obj[key]) ? obj[key] : [];
-        n += arr.filter((k) => k && k !== authorKey).length;
+        for (const k of arr) {
+          if (!k) continue;
+          if (authorKey && k === authorKey) continue;
+          n++;
+        }
       }
       return n;
     };
     const scanPost = (p) => {
-      if (p.authorKey === authorKey) {
-        if (Array.isArray(p.comments)) {
-          for (const c of p.comments) {
-            if (c.authorKey && c.authorKey !== authorKey) comments++;
-          }
-        }
-        reactions += countReactionsBy(p.reactions);
-        // Answers on my question count as engagement
-        if (Array.isArray(p.answers)) {
-          for (const a of p.answers) {
-            if (a.authorKey && a.authorKey !== authorKey) comments++;
-          }
+      if (Array.isArray(p.comments)) {
+        for (const c of p.comments) {
+          if (authorKey && c.authorKey === authorKey) continue;
+          comments++;
         }
       }
-      // Reactions on my answers (even on others' posts)
+      reactions += countReactions(p.reactions);
       if (Array.isArray(p.answers)) {
         for (const a of p.answers) {
-          if (a.authorKey === authorKey) reactions += countReactionsBy(a.reactions);
+          if (!authorKey || a.authorKey !== authorKey) comments++;
+          reactions += countReactions(a.reactions);
         }
       }
     };
