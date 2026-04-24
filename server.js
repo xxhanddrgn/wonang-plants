@@ -625,7 +625,7 @@ async function handleApi(req, res, url) {
   if (url === '/api/health' && req.method === 'GET') {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
-  if (url.startsWith('/api/notifications') && req.method === 'GET') {
+  if (url.startsWith('/api/notifications') && !url.startsWith('/api/notifications/my-posts') && req.method === 'GET') {
     // The client supplies its device authorKey so we can dedupe self-actions,
     // but we intentionally count every interaction on every board regardless
     // of who authored the parent post. This way every user on every corner
@@ -672,6 +672,67 @@ async function handleApi(req, res, url) {
     const guest = readGuestbook();
     for (const p of guest) scanPost(p);
     return sendJSON(res, 200, { comments, reactions });
+  }
+  if (url.startsWith('/api/notifications/my-posts') && req.method === 'GET') {
+    let u;
+    try { u = new URL(url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
+    const authorKey = u.searchParams.get('authorKey') || '';
+    if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+    const countUniqueReactors = (obj) => {
+      if (!obj || typeof obj !== 'object') return 0;
+      const reactors = new Set();
+      for (const key of Object.keys(obj)) {
+        const arr = Array.isArray(obj[key]) ? obj[key] : [];
+        for (const k of arr) {
+          if (!k) continue;
+          if (k === authorKey) continue;
+          reactors.add(k);
+        }
+      }
+      return reactors.size;
+    };
+    const sumActivityTs = (p) => {
+      let t = p.timestamp || 0;
+      if (Array.isArray(p.comments)) for (const c of p.comments) if (c.timestamp && c.timestamp > t) t = c.timestamp;
+      if (Array.isArray(p.answers)) for (const a of p.answers) if (a.timestamp && a.timestamp > t) t = a.timestamp;
+      return t;
+    };
+    const myPosts = [];
+    const collect = (board, boardLabel, p) => {
+      if (p.authorKey !== authorKey) return;
+      const reactionCount = countUniqueReactors(p.reactions);
+      const comments = Array.isArray(p.comments)
+        ? p.comments.filter((c) => c && c.authorKey !== authorKey).map((c) => ({
+            id: c.id, name: c.name, role: c.role, grade: c.grade, classNum: c.classNum,
+            message: (c.message || '').slice(0, 200), timestamp: c.timestamp || 0
+          }))
+        : [];
+      const answers = Array.isArray(p.answers)
+        ? p.answers.filter((a) => a && a.authorKey !== authorKey).map((a) => ({
+            id: a.id, name: a.name, role: a.role, grade: a.grade, classNum: a.classNum,
+            message: (a.message || '').slice(0, 200), timestamp: a.timestamp || 0
+          }))
+        : [];
+      if (reactionCount === 0 && comments.length === 0 && answers.length === 0) return;
+      myPosts.push({
+        board, boardLabel,
+        postId: p.id,
+        title: p.title || (p.message || '').slice(0, 40) || '(제목 없음)',
+        timestamp: p.timestamp || 0,
+        latestActivity: sumActivityTs(p),
+        reactionCount,
+        comments,
+        answers
+      });
+    };
+    const boardLabels = { student: '식물앨범', nature: '식물 이야기', qa: '질문 꽃', guestbook: '방명록' };
+    for (const type of Object.keys(POST_TYPES)) {
+      const list = readPostFile(type);
+      for (const p of list) collect(type, boardLabels[type] || type, p);
+    }
+    for (const p of readGuestbook()) collect('guestbook', boardLabels.guestbook, p);
+    myPosts.sort((a, b) => (b.latestActivity || 0) - (a.latestActivity || 0));
+    return sendJSON(res, 200, { posts: myPosts });
   }
   return sendJSON(res, 404, { error: 'not found' });
 }
