@@ -635,18 +635,20 @@ async function handleApi(req, res, url) {
     const authorKey = u.searchParams.get('authorKey') || '';
     if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
     let comments = 0, reactions = 0;
-    const countReactions = (obj) => {
+    // Treat one user reacting to a post as a single notification, even if
+    // they pressed multiple reaction types (heart + thumbs etc.).
+    const countUniqueReactors = (obj) => {
       if (!obj || typeof obj !== 'object') return 0;
-      let n = 0;
+      const reactors = new Set();
       for (const key of Object.keys(obj)) {
         const arr = Array.isArray(obj[key]) ? obj[key] : [];
         for (const k of arr) {
           if (!k) continue;
           if (authorKey && k === authorKey) continue;
-          n++;
+          reactors.add(k);
         }
       }
-      return n;
+      return reactors.size;
     };
     const scanPost = (p) => {
       if (Array.isArray(p.comments)) {
@@ -655,11 +657,11 @@ async function handleApi(req, res, url) {
           comments++;
         }
       }
-      reactions += countReactions(p.reactions);
+      reactions += countUniqueReactors(p.reactions);
       if (Array.isArray(p.answers)) {
         for (const a of p.answers) {
           if (!authorKey || a.authorKey !== authorKey) comments++;
-          reactions += countReactions(a.reactions);
+          reactions += countUniqueReactors(a.reactions);
         }
       }
     };
