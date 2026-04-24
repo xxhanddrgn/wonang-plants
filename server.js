@@ -191,8 +191,10 @@ function validateGuestPost(body) {
   else if (message.length > MAX_MSG_LEN) errs.push('message too long');
   const authorKey = body.authorKey == null ? '' : String(body.authorKey);
   if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) errs.push('authorKey invalid');
+  const audioCheck = validateAudio(body.audio);
+  if (audioCheck.err) errs.push(audioCheck.err);
   if (errs.length) return { errs };
-  return { errs, clean: { name, role, grade, classNum, message, authorKey: authorKey || null } };
+  return { errs, clean: { name, role, grade, classNum, message, authorKey: authorKey || null, audio: audioCheck.audio || null } };
 }
 
 function sendJSON(res, status, data) {
@@ -387,8 +389,8 @@ async function handleApi(req, res, url) {
     const ip = getClientIp(req);
     if (!rateOk(ip)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
     let body;
-    try { body = await readJSONBody(req); }
-    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    try { body = await readJSONBody(req, 5_000_000); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
     const { errs, clean } = validateGuestPost(body);
     if (errs && errs.length) return sendJSON(res, 400, { error: '유효하지 않은 요청', details: errs });
     const list = readGuestbook();
@@ -402,8 +404,8 @@ async function handleApi(req, res, url) {
     const ip = getClientIp(req);
     if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
     let body;
-    try { body = await readJSONBody(req); }
-    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    try { body = await readJSONBody(req, 5_000_000); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
     const id = String(body && body.id || '');
     const authorKey = String(body && body.authorKey || '');
     const message = String(body && body.message || '').replace(/\r\n/g, '\n').trim();
@@ -420,6 +422,15 @@ async function handleApi(req, res, url) {
       return sendJSON(res, 403, { error: '본인이 작성한 방명록만 수정할 수 있어요.' });
     }
     list[idx].message = message;
+    if (body && Object.prototype.hasOwnProperty.call(body, 'audio')) {
+      if (body.audio === null || body.audio === '') {
+        list[idx].audio = null;
+      } else {
+        const audioCheck = validateAudio(body.audio);
+        if (audioCheck.err) return sendJSON(res, 400, { error: audioCheck.err });
+        list[idx].audio = audioCheck.audio;
+      }
+    }
     list[idx].editedAt = Date.now();
     await writeGuestbook(list);
     return sendJSON(res, 200, { entry: list[idx], list });
@@ -774,27 +785,37 @@ async function handleApi(req, res, url) {
 // ==================== POSTS CONTENT TYPES ====================
 const MAX_PHOTO_BODY = 1_200_000;   // ~1.15 MB, fits 500KB base64 JPEG + overhead
 const MAX_POSTS_ENTRIES = 2000;
+const MAX_AUDIO_BYTES = 4_200_000;   // ~4.2 MB base64 ≈ 3 MB raw
+const AUDIO_DATA_RE = /^data:audio\/(mpeg|mp3|mp4|wav|wave|x-wav|ogg|webm|aac|m4a|x-m4a);base64,[A-Za-z0-9+/=]+$/;
+function validateAudio(raw) {
+  if (!raw) return { audio: null };
+  if (typeof raw !== 'string') return { err: 'audio invalid' };
+  if (!AUDIO_DATA_RE.test(raw)) return { err: 'audio invalid' };
+  if (raw.length > MAX_AUDIO_BYTES) return { err: 'audio too large' };
+  return { audio: raw };
+}
 const POST_TYPES = {
   student: {
     file: path.join(DATA_DIR, 'posts-student.json'),
-    extras: ['location', 'title', 'photos'],
+    extras: ['location', 'title', 'photos', 'audio'],
     maxMsgLen: 500,
     hasPhoto: true,
-    photoBodyLimit: 3_800_000
+    photoBodyLimit: 8_500_000
   },
   qa: {
     file: path.join(DATA_DIR, 'posts-qa.json'),
-    extras: ['title', 'photo'],
+    extras: ['title', 'photo', 'audio'],
     maxMsgLen: 2000,
     hasAnswers: true,
-    hasOptionalPhoto: true
+    hasOptionalPhoto: true,
+    photoBodyLimit: 5_500_000
   },
   nature: {
     file: path.join(DATA_DIR, 'posts-nature.json'),
-    extras: ['title', 'origin', 'source', 'photos'],
+    extras: ['title', 'origin', 'source', 'photos', 'audio'],
     maxMsgLen: 2000,
     hasOptionalPhotos: true,
-    photoBodyLimit: 3_800_000
+    photoBodyLimit: 8_500_000
   }
 };
 // Ensure each data file exists as []
@@ -898,7 +919,9 @@ function validateStudentExtras(body) {
       photos.push(p);
     }
   }
-  return { errs, clean: { location, title, photos } };
+  const audioCheck = validateAudio(body && body.audio);
+  if (audioCheck.err) errs.push(audioCheck.err);
+  return { errs, clean: { location, title, photos, audio: audioCheck.audio || null } };
 }
 function validateQaExtras(body) {
   const errs = [];
@@ -911,7 +934,9 @@ function validateQaExtras(body) {
     else if (photoRaw.length > 900000) errs.push('photo too large');
     else photo = photoRaw;
   }
-  return { errs, clean: { title, photo } };
+  const audioCheck = validateAudio(body && body.audio);
+  if (audioCheck.err) errs.push(audioCheck.err);
+  return { errs, clean: { title, photo, audio: audioCheck.audio || null } };
 }
 function validateNatureExtras(body) {
   const errs = [];
@@ -937,7 +962,9 @@ function validateNatureExtras(body) {
       }
     }
   }
-  return { errs, clean: { title, origin, source, photos } };
+  const audioCheck = validateAudio(body && body.audio);
+  if (audioCheck.err) errs.push(audioCheck.err);
+  return { errs, clean: { title, origin, source, photos, audio: audioCheck.audio || null } };
 }
 
 function validatePost(type, body) {
@@ -1007,6 +1034,25 @@ async function handlePostsApi(req, res, type, sub) {
     if (!message) return sendJSON(res, 400, { error: 'message required' });
     if (message.length > cfg.maxMsgLen) return sendJSON(res, 400, { error: 'message too long' });
     list[idx].message = message;
+    if (body && Object.prototype.hasOwnProperty.call(body, 'audio')) {
+      if (body.audio === null || body.audio === '') {
+        list[idx].audio = null;
+      } else {
+        const audioCheck = validateAudio(body.audio);
+        if (audioCheck.err) return sendJSON(res, 400, { error: audioCheck.err });
+        list[idx].audio = audioCheck.audio;
+      }
+    }
+    if (body && Object.prototype.hasOwnProperty.call(body, 'photo') && type === 'qa') {
+      if (body.photo === null || body.photo === '') {
+        list[idx].photo = null;
+      } else if (typeof body.photo === 'string') {
+        if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(body.photo) || body.photo.length > 900000) {
+          return sendJSON(res, 400, { error: 'photo invalid' });
+        }
+        list[idx].photo = body.photo;
+      }
+    }
     if (type === 'student') {
       if (body && body.location) list[idx].location = body.location === 'offsite' ? 'offsite' : 'onsite';
       if (body && typeof body.title === 'string') {
