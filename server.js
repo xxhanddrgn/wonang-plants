@@ -626,17 +626,29 @@ async function handleApi(req, res, url) {
     return sendJSON(res, 200, { ok: true, entries: readBoard().length, guestbook: readGuestbook().length });
   }
   if (url.startsWith('/api/notifications') && !url.startsWith('/api/notifications/my-posts') && req.method === 'GET') {
-    // The client supplies its device authorKey so we can dedupe self-actions,
-    // but we intentionally count every interaction on every board regardless
-    // of who authored the parent post. This way every user on every corner
-    // of the site gets bell alerts for new likes, comments, and answers.
     let u;
     try { u = new URL(req.url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
     const authorKey = u.searchParams.get('authorKey') || '';
+    const nameParam = (u.searchParams.get('name') || '').trim();
+    const roleParam = (u.searchParams.get('role') || '').trim();
+    const gradeParam = u.searchParams.get('grade') || '';
+    const classParam = u.searchParams.get('classNum') || '';
     if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
+    if (!authorKey && !nameParam) return sendJSON(res, 200, { comments: 0, reactions: 0 });
+    const isMine = (obj) => {
+      if (!obj) return false;
+      if (authorKey && obj.authorKey === authorKey) return true;
+      if (nameParam && obj.name === nameParam) {
+        const objRole = obj.role || '';
+        if (roleParam && objRole !== roleParam) return false;
+        if (roleParam === 'student') {
+          return String(obj.grade || '') === gradeParam && String(obj.classNum || '') === classParam;
+        }
+        return true;
+      }
+      return false;
+    };
     let comments = 0, reactions = 0;
-    // Treat one user reacting to a post as a single notification, even if
-    // they pressed multiple reaction types (heart + thumbs etc.).
     const countUniqueReactors = (obj) => {
       if (!obj || typeof obj !== 'object') return 0;
       const reactors = new Set();
@@ -651,17 +663,17 @@ async function handleApi(req, res, url) {
       return reactors.size;
     };
     const scanPost = (p) => {
+      if (!isMine(p)) return;
       if (Array.isArray(p.comments)) {
         for (const c of p.comments) {
-          if (authorKey && c.authorKey === authorKey) continue;
+          if (isMine(c)) continue;
           comments++;
         }
       }
       reactions += countUniqueReactors(p.reactions);
       if (Array.isArray(p.answers)) {
         for (const a of p.answers) {
-          if (!authorKey || a.authorKey !== authorKey) comments++;
-          reactions += countUniqueReactors(a.reactions);
+          if (!isMine(a)) comments++;
         }
       }
     };
