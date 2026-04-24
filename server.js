@@ -631,7 +631,7 @@ async function handleApi(req, res, url) {
     // of who authored the parent post. This way every user on every corner
     // of the site gets bell alerts for new likes, comments, and answers.
     let u;
-    try { u = new URL(url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
+    try { u = new URL(req.url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
     const authorKey = u.searchParams.get('authorKey') || '';
     if (authorKey && !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey invalid' });
     let comments = 0, reactions = 0;
@@ -675,7 +675,7 @@ async function handleApi(req, res, url) {
   }
   if (url.startsWith('/api/notifications/my-posts') && req.method === 'GET') {
     let u;
-    try { u = new URL(url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
+    try { u = new URL(req.url, 'http://x'); } catch (_) { return sendJSON(res, 400, { error: 'bad url' }); }
     const authorKey = u.searchParams.get('authorKey') || '';
     if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
     const countUniqueReactors = (obj) => {
