@@ -724,6 +724,41 @@ function writePostFile(type, list) {
   return postWriteChains[type];
 }
 
+// One-time migration: comments posted on Q&A through the brief
+// generic-comment system are recovered by promoting them into the
+// answers list so they remain visible.
+function migrateQaCommentsIntoAnswers() {
+  try {
+    const list = readPostFile('qa');
+    let dirty = false;
+    for (const p of list) {
+      if (!Array.isArray(p.comments) || p.comments.length === 0) continue;
+      if (!Array.isArray(p.answers)) p.answers = [];
+      const sorted = p.comments.slice().sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      for (const c of sorted) {
+        const message = (typeof c.message === 'string' ? c.message : '').trim();
+        if (!message) continue;
+        p.answers.push({
+          id: 'a_' + (c.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 8))),
+          timestamp: c.timestamp || Date.now(),
+          name: c.name || '익명',
+          role: c.role || null,
+          grade: c.grade || null,
+          classNum: c.classNum || null,
+          message,
+          authorKey: c.authorKey || null,
+          reactions: {},
+          migratedFromComment: true
+        });
+      }
+      p.comments = [];
+      dirty = true;
+    }
+    if (dirty) writePostFile('qa', list);
+  } catch (e) { console.error('qa comment migration failed:', e); }
+}
+migrateQaCommentsIntoAnswers();
+
 function validatePostCommon(body, { maxMsgLen }) {
   const errs = [];
   const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ').slice(0, 40);
