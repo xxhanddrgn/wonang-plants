@@ -527,6 +527,40 @@ async function handleApi(req, res, url) {
     await writeGuestbook(list);
     return sendJSON(res, 200, { ok: true, entry: post, list });
   }
+  if (url === '/api/guestbook/comment/edit' && req.method === 'POST') {
+    const ip = getClientIp(req);
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String(body && body.postId || '');
+    const commentId = String(body && body.commentId || '');
+    const authorKey = String(body && body.authorKey || '');
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!postId || !commentId) return sendJSON(res, 400, { error: 'postId and commentId required' });
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > 300) return sendJSON(res, 400, { error: 'message too long' });
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+    const list = readGuestbook();
+    const pIdx = list.findIndex((e) => e.id === postId);
+    if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+    const post = list[pIdx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    const cIdx = post.comments.findIndex((c) => c.id === commentId);
+    if (cIdx === -1) return sendJSON(res, 404, { error: 'comment not found' });
+    const comment = post.comments[cIdx];
+    if (!isAdmin) {
+      if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+      if (!comment.authorKey || !timingSafeEq(comment.authorKey, authorKey)) {
+        return sendJSON(res, 403, { error: '본인이 작성한 댓글만 수정할 수 있어요.' });
+      }
+    }
+    comment.message = message;
+    comment.editedAt = Date.now();
+    await writeGuestbook(list);
+    return sendJSON(res, 200, { ok: true, comment, entry: post, list });
+  }
   if (url === '/api/guestbook/react' && req.method === 'POST') {
     const ip = getClientIp(req);
     if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.' });
@@ -1226,6 +1260,39 @@ async function handlePostsApi(req, res, type, sub) {
     await writePostFile(type, list);
     return sendJSON(res, 200, { ok: true, entry: post, list });
   }
+  if (sub === 'comment/edit' && req.method === 'POST') {
+    if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const postId = String((body && body.postId) || '');
+    const commentId = String((body && body.commentId) || '');
+    const authorKey = String((body && body.authorKey) || '');
+    const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+    if (!postId || !commentId) return sendJSON(res, 400, { error: 'postId and commentId required' });
+    if (!message) return sendJSON(res, 400, { error: 'message required' });
+    if (message.length > 300) return sendJSON(res, 400, { error: 'message too long' });
+    const adminHeader = req.headers['x-admin-token'] || '';
+    const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+    const list = readPostFile(type);
+    const pIdx = list.findIndex((e) => e.id === postId);
+    if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+    const post = list[pIdx];
+    if (!Array.isArray(post.comments)) post.comments = [];
+    const cIdx = post.comments.findIndex((c) => c.id === commentId);
+    if (cIdx === -1) return sendJSON(res, 404, { error: 'comment not found' });
+    const comment = post.comments[cIdx];
+    if (!isAdmin) {
+      if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+      if (!comment.authorKey || !timingSafeEq(comment.authorKey, authorKey)) {
+        return sendJSON(res, 403, { error: '본인이 작성한 댓글만 수정할 수 있어요.' });
+      }
+    }
+    comment.message = message;
+    comment.editedAt = Date.now();
+    await writePostFile(type, list);
+    return sendJSON(res, 200, { ok: true, comment, entry: post, list });
+  }
   // Admin: edit / delete / clear
   if (sub === 'edit' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -1334,6 +1401,39 @@ async function handlePostsApi(req, res, type, sub) {
       post.answers.splice(aIdx, 1);
       await writePostFile('qa', list);
       return sendJSON(res, 200, { ok: true, entry: post, list });
+    }
+    if (sub === 'answer/edit' && req.method === 'POST') {
+      if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
+      let body;
+      try { body = await readJSONBody(req); }
+      catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      const postId = String((body && body.postId) || '');
+      const answerId = String((body && body.answerId) || '');
+      const authorKey = String((body && body.authorKey) || '');
+      const message = String((body && body.message) || '').replace(/\r\n/g, '\n').trim();
+      if (!postId || !answerId) return sendJSON(res, 400, { error: 'postId and answerId required' });
+      if (!message) return sendJSON(res, 400, { error: 'message required' });
+      if (message.length > 2000) return sendJSON(res, 400, { error: 'message too long' });
+      const adminHeader = req.headers['x-admin-token'] || '';
+      const isAdmin = ADMIN_TOKEN && adminHeader && timingSafeEq(adminHeader, ADMIN_TOKEN);
+      const list = readPostFile('qa');
+      const pIdx = list.findIndex((e) => e.id === postId);
+      if (pIdx === -1) return sendJSON(res, 404, { error: 'post not found' });
+      const post = list[pIdx];
+      if (!Array.isArray(post.answers)) post.answers = [];
+      const aIdx = post.answers.findIndex((a) => a.id === answerId);
+      if (aIdx === -1) return sendJSON(res, 404, { error: 'answer not found' });
+      const ans = post.answers[aIdx];
+      if (!isAdmin) {
+        if (!authorKey || !AUTHOR_KEY_RE.test(authorKey)) return sendJSON(res, 400, { error: 'authorKey required' });
+        if (!ans.authorKey || !timingSafeEq(ans.authorKey, authorKey)) {
+          return sendJSON(res, 403, { error: '본인이 작성한 댓글만 수정할 수 있어요.' });
+        }
+      }
+      ans.message = message;
+      ans.editedAt = Date.now();
+      await writePostFile('qa', list);
+      return sendJSON(res, 200, { ok: true, answer: ans, entry: post, list });
     }
     if (sub === 'answer/react' && req.method === 'POST') {
       if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
