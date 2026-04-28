@@ -804,7 +804,7 @@ async function handleApi(req, res, url) {
         answers
       });
     };
-    const boardLabels = { student: '식물앨범', nature: '식물 이야기', qa: '질문 꽃', guestbook: '방명록' };
+    const boardLabels = { student: '식물앨범', nature: '자연 이야기', qa: '질문 꽃', guestbook: '방명록' };
     for (const type of Object.keys(POST_TYPES)) {
       const list = readPostFile(type);
       for (const p of list) collect(type, boardLabels[type] || type, p);
