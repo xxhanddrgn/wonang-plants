@@ -10,6 +10,7 @@ const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'leaderboard.json');
 const GUESTBOOK_FILE = path.join(DATA_DIR, 'guestbook.json');
+const QA_COUNT_OVERRIDE_FILE = path.join(DATA_DIR, 'qa-count-overrides.json');
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const ADMIN_TOKEN_RAW = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString('hex');
@@ -143,6 +144,26 @@ function writeBoard(list) {
   return writeChain;
 }
 
+function readQaCountOverrides() {
+  try {
+    if (!fs.existsSync(QA_COUNT_OVERRIDE_FILE)) return {};
+    const raw = fs.readFileSync(QA_COUNT_OVERRIDE_FILE, 'utf-8');
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+  } catch (e) { return {}; }
+}
+let qaOverrideWriteChain = Promise.resolve();
+function writeQaCountOverrides(obj) {
+  qaOverrideWriteChain = qaOverrideWriteChain.then(() => new Promise((resolve, reject) => {
+    const tmp = QA_COUNT_OVERRIDE_FILE + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(obj), 'utf-8', (err) => {
+      if (err) return reject(err);
+      fs.rename(tmp, QA_COUNT_OVERRIDE_FILE, (err2) => err2 ? reject(err2) : resolve());
+    });
+  })).catch((err) => { console.error('writeQaCountOverrides failed', err); });
+  return qaOverrideWriteChain;
+}
+
 function readGuestbook() {
   try {
     const raw = fs.readFileSync(GUESTBOOK_FILE, 'utf-8');
@@ -168,6 +189,42 @@ const REACTION_TYPES = ['heart', 'thumbs'];
 const VALID_ROLES = ['student', 'teacher', 'parent', 'guest'];
 function normalizeRole(r) {
   return VALID_ROLES.includes(r) ? r : 'student';
+}
+
+// Admin-only override of an existing post / comment / answer's identity.
+// Returns true when something changed. Trims and length-caps name; lets the
+// admin reassign role and (for students) grade / classNum too.
+function applyAdminIdentity(target, body, isAdmin) {
+  if (!isAdmin || !target || !body) return false;
+  let changed = false;
+  if (typeof body.name === 'string') {
+    const name = body.name.trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (name && name !== target.name) { target.name = name; changed = true; }
+  }
+  if (typeof body.role === 'string' && body.role) {
+    const role = normalizeRole(body.role);
+    if (role !== target.role) {
+      target.role = role;
+      if (role !== 'student') { target.grade = null; target.classNum = null; }
+      changed = true;
+    }
+  }
+  if (target.role === 'student') {
+    if (body.grade != null) {
+      const g = Math.floor(Number(body.grade));
+      if (Number.isFinite(g) && GRADE_CLASS_MAP[g] && g !== target.grade) {
+        target.grade = g; changed = true;
+      }
+    }
+    if (body.classNum != null) {
+      const c = Math.floor(Number(body.classNum));
+      const allowed = GRADE_CLASS_MAP[target.grade] || [];
+      if (Number.isFinite(c) && allowed.includes(c) && c !== target.classNum) {
+        target.classNum = c; changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 function validateGuestPost(body) {
@@ -422,6 +479,7 @@ async function handleApi(req, res, url) {
       return sendJSON(res, 403, { error: '본인이 작성한 방명록만 수정할 수 있어요.' });
     }
     list[idx].message = message;
+    applyAdminIdentity(list[idx], body, isAdmin);
     if (body && Object.prototype.hasOwnProperty.call(body, 'audio')) {
       if (body.audio === null || body.audio === '') {
         list[idx].audio = null;
@@ -557,6 +615,7 @@ async function handleApi(req, res, url) {
       }
     }
     comment.message = message;
+    applyAdminIdentity(comment, body, isAdmin);
     comment.editedAt = Date.now();
     await writeGuestbook(list);
     return sendJSON(res, 200, { ok: true, comment, entry: post, list });
@@ -639,6 +698,113 @@ async function handleApi(req, res, url) {
   if (url === '/api/admin/verify' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
     return sendJSON(res, 200, { ok: true });
+  }
+  if (url === '/api/halloffame/qa' && req.method === 'GET') {
+    const list = readPostFile('qa');
+    const overrides = readQaCountOverrides();
+    const tally = new Map();
+    const keyOf = (name, role, grade, classNum) => {
+      if (role === 'student') return `student::${name}::${grade}-${classNum}`;
+      return `${role || 'guest'}::${name}`;
+    };
+    for (const p of list) {
+      if (p.role !== 'student') continue;
+      const k = keyOf(p.name, 'student', p.grade, p.classNum);
+      const cur = tally.get(k) || { name: p.name, role: 'student', grade: p.grade, classNum: p.classNum, count: 0 };
+      cur.count += 1;
+      tally.set(k, cur);
+    }
+    // Apply overrides — both for existing tallies and new ones admin manually added.
+    for (const k of Object.keys(overrides)) {
+      const ov = overrides[k];
+      if (!ov || typeof ov !== 'object') continue;
+      const cur = tally.get(k) || { name: ov.name || '', role: 'student', grade: ov.grade || null, classNum: ov.classNum || null, count: 0 };
+      cur.count = Math.max(0, (cur.count + (ov.delta || 0)) | 0);
+      tally.set(k, cur);
+    }
+    const entries = Array.from(tally.values())
+      .filter((e) => e.count > 0)
+      .sort((a, b) => b.count - a.count || (a.name || '').localeCompare(b.name || ''));
+    return sendJSON(res, 200, { entries });
+  }
+  if (url === '/api/halloffame/qa/adjust' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const name = String((body && body.name) || '').trim().slice(0, 40);
+    const grade = Math.floor(Number(body && body.grade));
+    const classNum = Math.floor(Number(body && body.classNum));
+    if (!name) return sendJSON(res, 400, { error: 'name required' });
+    if (!GRADE_CLASS_MAP[grade] || !GRADE_CLASS_MAP[grade].includes(classNum)) {
+      return sendJSON(res, 400, { error: 'grade/classNum invalid' });
+    }
+    const k = `student::${name}::${grade}-${classNum}`;
+    const overrides = readQaCountOverrides();
+    if (body && body.absoluteCount != null) {
+      // Admin sets the displayed total directly. We store delta = desired - actual.
+      const list = readPostFile('qa');
+      const actual = list.filter((p) => p.role === 'student' && p.name === name && p.grade === grade && p.classNum === classNum).length;
+      const desired = Math.max(0, Math.floor(Number(body.absoluteCount)) || 0);
+      overrides[k] = { name, grade, classNum, delta: desired - actual };
+    } else if (body && body.delta != null) {
+      const cur = overrides[k] || { name, grade, classNum, delta: 0 };
+      cur.delta = Math.floor(Number(body.delta)) || 0;
+      cur.name = name; cur.grade = grade; cur.classNum = classNum;
+      overrides[k] = cur;
+    } else {
+      delete overrides[k];
+    }
+    if (overrides[k] && (overrides[k].delta === 0)) delete overrides[k];
+    await writeQaCountOverrides(overrides);
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (url === '/api/admin/rename' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    const board = String((body && body.board) || '');
+    const postId = String((body && body.postId) || '');
+    const commentId = String((body && body.commentId) || '');
+    const answerId = String((body && body.answerId) || '');
+    if (!postId) return sendJSON(res, 400, { error: 'postId required' });
+    let list, target;
+    if (board === 'guestbook') {
+      list = readGuestbook();
+      const post = list.find((e) => e.id === postId);
+      if (!post) return sendJSON(res, 404, { error: 'post not found' });
+      if (commentId) {
+        if (!Array.isArray(post.comments)) post.comments = [];
+        target = post.comments.find((c) => c.id === commentId);
+        if (!target) return sendJSON(res, 404, { error: 'comment not found' });
+      } else {
+        target = post;
+      }
+    } else if (POST_TYPES[board]) {
+      list = readPostFile(board);
+      const post = list.find((e) => e.id === postId);
+      if (!post) return sendJSON(res, 404, { error: 'post not found' });
+      if (answerId) {
+        if (!Array.isArray(post.answers)) post.answers = [];
+        target = post.answers.find((a) => a.id === answerId);
+        if (!target) return sendJSON(res, 404, { error: 'answer not found' });
+      } else if (commentId) {
+        if (!Array.isArray(post.comments)) post.comments = [];
+        target = post.comments.find((c) => c.id === commentId);
+        if (!target) return sendJSON(res, 404, { error: 'comment not found' });
+      } else {
+        target = post;
+      }
+    } else {
+      return sendJSON(res, 400, { error: 'unknown board' });
+    }
+    const changed = applyAdminIdentity(target, body, true);
+    if (!changed) return sendJSON(res, 400, { error: '바꿀 내용이 없어요.' });
+    target.editedAt = Date.now();
+    if (board === 'guestbook') await writeGuestbook(list);
+    else await writePostFile(board, list);
+    return sendJSON(res, 200, { ok: true, target, list });
   }
   if (url === '/api/audio/list' && req.method === 'GET') {
     let files = [];
@@ -1068,6 +1234,7 @@ async function handlePostsApi(req, res, type, sub) {
     if (!message) return sendJSON(res, 400, { error: 'message required' });
     if (message.length > cfg.maxMsgLen) return sendJSON(res, 400, { error: 'message too long' });
     list[idx].message = message;
+    applyAdminIdentity(list[idx], body, isAdmin);
     if (body && Object.prototype.hasOwnProperty.call(body, 'audio')) {
       if (body.audio === null || body.audio === '') {
         list[idx].audio = null;
@@ -1289,6 +1456,7 @@ async function handlePostsApi(req, res, type, sub) {
       }
     }
     comment.message = message;
+    applyAdminIdentity(comment, body, isAdmin);
     comment.editedAt = Date.now();
     await writePostFile(type, list);
     return sendJSON(res, 200, { ok: true, comment, entry: post, list });
@@ -1431,6 +1599,7 @@ async function handlePostsApi(req, res, type, sub) {
         }
       }
       ans.message = message;
+      applyAdminIdentity(ans, body, isAdmin);
       ans.editedAt = Date.now();
       await writePostFile('qa', list);
       return sendJSON(res, 200, { ok: true, answer: ans, entry: post, list });
