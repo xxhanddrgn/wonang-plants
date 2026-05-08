@@ -906,6 +906,32 @@ const MAX_PHOTO_BODY = 1_200_000;   // ~1.15 MB, fits 500KB base64 JPEG + overhe
 const MAX_POSTS_ENTRIES = 2000;
 const MAX_AUDIO_BYTES = 4_200_000;   // ~4.2 MB base64 ≈ 3 MB raw
 const AUDIO_DATA_RE = /^data:audio\/(mpeg|mp3|mp4|wav|wave|x-wav|ogg|webm|aac|m4a|x-m4a);base64,[A-Za-z0-9+/=]+$/;
+// A "light" version of a post with its heavy media stripped down to just
+// what the list cards need: a single cover photo for the thumbnail, and
+// boolean flags for audio + photo count. The detail screen fetches the
+// full post via /api/posts/:type/item/:id when the card is opened.
+function toLightPost(p) {
+  if (!p || typeof p !== 'object') return p;
+  const o = Object.assign({}, p);
+  if (Array.isArray(p.photos)) {
+    o.photoCount = p.photos.length;
+    o.photos = p.photos.length ? [p.photos[0]] : [];
+  }
+  if (typeof p.photo === 'string' && p.photo) {
+    o.hasPhoto = true;
+    // Keep p.photo for QA cards' thumbnail; that one's already a single image.
+  }
+  if (typeof p.audio === 'string' && p.audio) {
+    o.hasAudio = true;
+    o.audio = null;
+  } else {
+    o.hasAudio = false;
+  }
+  return o;
+}
+function toLightList(list) {
+  return Array.isArray(list) ? list.map(toLightPost) : list;
+}
 function validateAudio(raw) {
   if (!raw) return { audio: null };
   if (typeof raw !== 'string') return { err: 'audio invalid' };
@@ -1108,8 +1134,19 @@ async function handlePostsApi(req, res, type, sub) {
   const bodyLimit = cfg.photoBodyLimit || ((cfg.hasPhoto || cfg.hasOptionalPhoto || cfg.hasOptionalPhotos) ? MAX_PHOTO_BODY : MAX_BODY_BYTES);
 
   // GET /api/posts/:type
+  // Always returns a light list with media stripped — the album/nature/qa
+  // boards used to push every base64 photo and audio in one response,
+  // which made the page take seconds to load for a board with many posts.
+  // Detail screens refetch the full post via /api/posts/:type/item/:id.
   if (sub === '' && req.method === 'GET') {
-    return sendJSON(res, 200, { list: readPostFile(type) });
+    return sendJSON(res, 200, { list: toLightList(readPostFile(type)) });
+  }
+  // GET /api/posts/:type/item/:id — full post, used by the detail screen.
+  if (req.method === 'GET' && /^item\/[A-Za-z0-9_-]+$/.test(sub)) {
+    const id = sub.slice('item/'.length);
+    const post = readPostFile(type).find((e) => e.id === id);
+    if (!post) return sendJSON(res, 404, { error: 'not found' });
+    return sendJSON(res, 200, { entry: post });
   }
   // POST /api/posts/:type  (create)
   if (sub === '' && req.method === 'POST') {
@@ -1128,7 +1165,7 @@ async function handlePostsApi(req, res, type, sub) {
     list.push(entry);
     if (list.length > MAX_POSTS_ENTRIES) list.splice(0, list.length - MAX_POSTS_ENTRIES);
     await writePostFile(type, list);
-    return sendJSON(res, 201, { entry, list });
+    return sendJSON(res, 201, { entry, list: toLightList(list) });
   }
   // POST /api/posts/:type/user-edit
   if (sub === 'user-edit' && req.method === 'POST') {
@@ -1218,7 +1255,7 @@ async function handlePostsApi(req, res, type, sub) {
     }
     list[idx].editedAt = Date.now();
     await writePostFile(type, list);
-    return sendJSON(res, 200, { entry: list[idx], list });
+    return sendJSON(res, 200, { entry: list[idx], list: toLightList(list) });
   }
   // POST /api/posts/:type/user-delete
   if (sub === 'user-delete' && req.method === 'POST') {
@@ -1240,7 +1277,7 @@ async function handlePostsApi(req, res, type, sub) {
     }
     list.splice(idx, 1);
     await writePostFile(type, list);
-    return sendJSON(res, 200, { ok: true, list });
+    return sendJSON(res, 200, { ok: true, list: toLightList(list) });
   }
   // POST /api/posts/:type/react
   if (sub === 'react' && req.method === 'POST') {
@@ -1265,7 +1302,7 @@ async function handlePostsApi(req, res, type, sub) {
     else bucket.splice(pos, 1);
     post.reactions[reaction] = bucket;
     await writePostFile(type, list);
-    return sendJSON(res, 200, { entry: post, list });
+    return sendJSON(res, 200, { entry: post, list: toLightList(list) });
   }
   // POST /api/posts/:type/comment
   if (sub === 'comment' && req.method === 'POST') {
@@ -1314,7 +1351,7 @@ async function handlePostsApi(req, res, type, sub) {
     };
     post.comments.push(comment);
     await writePostFile(type, list);
-    return sendJSON(res, 201, { comment, entry: post, list });
+    return sendJSON(res, 201, { comment, entry: post, list: toLightList(list) });
   }
   // POST /api/posts/:type/comment/delete
   if (sub === 'comment/delete' && req.method === 'POST') {
@@ -1344,7 +1381,7 @@ async function handlePostsApi(req, res, type, sub) {
     }
     post.comments.splice(cIdx, 1);
     await writePostFile(type, list);
-    return sendJSON(res, 200, { ok: true, entry: post, list });
+    return sendJSON(res, 200, { ok: true, entry: post, list: toLightList(list) });
   }
   if (sub === 'comment/edit' && req.method === 'POST') {
     if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
@@ -1378,7 +1415,7 @@ async function handlePostsApi(req, res, type, sub) {
     applyAdminIdentity(comment, body, isAdmin);
     comment.editedAt = Date.now();
     await writePostFile(type, list);
-    return sendJSON(res, 200, { ok: true, comment, entry: post, list });
+    return sendJSON(res, 200, { ok: true, comment, entry: post, list: toLightList(list) });
   }
   // Admin: edit / delete / clear
   if (sub === 'edit' && req.method === 'POST') {
@@ -1397,7 +1434,7 @@ async function handlePostsApi(req, res, type, sub) {
     list[idx].message = message;
     list[idx].editedAt = Date.now();
     await writePostFile(type, list);
-    return sendJSON(res, 200, { entry: list[idx], list });
+    return sendJSON(res, 200, { entry: list[idx], list: toLightList(list) });
   }
   if (sub === 'delete' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -1411,7 +1448,7 @@ async function handlePostsApi(req, res, type, sub) {
     if (idx === -1) return sendJSON(res, 404, { error: 'not found' });
     list.splice(idx, 1);
     await writePostFile(type, list);
-    return sendJSON(res, 200, { ok: true, list });
+    return sendJSON(res, 200, { ok: true, list: toLightList(list) });
   }
   if (sub === 'clear' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -1458,7 +1495,7 @@ async function handlePostsApi(req, res, type, sub) {
       };
       post.answers.push(answer);
       await writePostFile('qa', list);
-      return sendJSON(res, 201, { answer, entry: post, list });
+      return sendJSON(res, 201, { answer, entry: post, list: toLightList(list) });
     }
     if (sub === 'answer/delete' && req.method === 'POST') {
       if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
@@ -1487,7 +1524,7 @@ async function handlePostsApi(req, res, type, sub) {
       }
       post.answers.splice(aIdx, 1);
       await writePostFile('qa', list);
-      return sendJSON(res, 200, { ok: true, entry: post, list });
+      return sendJSON(res, 200, { ok: true, entry: post, list: toLightList(list) });
     }
     if (sub === 'answer/edit' && req.method === 'POST') {
       if (!rateOk(ip, 10, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
@@ -1521,7 +1558,7 @@ async function handlePostsApi(req, res, type, sub) {
       applyAdminIdentity(ans, body, isAdmin);
       ans.editedAt = Date.now();
       await writePostFile('qa', list);
-      return sendJSON(res, 200, { ok: true, answer: ans, entry: post, list });
+      return sendJSON(res, 200, { ok: true, answer: ans, entry: post, list: toLightList(list) });
     }
     if (sub === 'answer/react' && req.method === 'POST') {
       if (!rateOk(ip, 20, 10000)) return sendJSON(res, 429, { error: '요청이 너무 많아요.' });
@@ -1549,7 +1586,7 @@ async function handlePostsApi(req, res, type, sub) {
       else bucket.splice(pos, 1);
       ans.reactions[reaction] = bucket;
       await writePostFile('qa', list);
-      return sendJSON(res, 200, { entry: post, list });
+      return sendJSON(res, 200, { entry: post, list: toLightList(list) });
     }
   }
   return sendJSON(res, 404, { error: 'not found' });
