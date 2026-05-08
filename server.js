@@ -3,6 +3,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -235,6 +236,24 @@ function validateGuestPost(body) {
 
 function sendJSON(res, status, data) {
   const body = JSON.stringify(data);
+  // Compress JSON for clients that accept it. Photos are base64 JPEG so
+  // gzip only saves ~15-25%, but text-heavy responses (lists with many
+  // comments) shrink further and the cost is negligible thanks to
+  // built-in zlib.
+  const accept = (res.req && res.req.headers && res.req.headers['accept-encoding']) || '';
+  if (body.length > 1024 && /gzip/i.test(accept)) {
+    try {
+      const gzipped = zlib.gzipSync(body);
+      res.writeHead(status, {
+        'Content-Type': MIME['.json'],
+        'Cache-Control': 'no-store',
+        'Content-Encoding': 'gzip',
+        'Content-Length': gzipped.length,
+        'Vary': 'Accept-Encoding'
+      });
+      return res.end(gzipped);
+    } catch (_) { /* fall through to plain */ }
+  }
   res.writeHead(status, {
     'Content-Type': MIME['.json'],
     'Cache-Control': 'no-store'
@@ -915,11 +934,19 @@ function toLightPost(p) {
   const o = Object.assign({}, p);
   if (Array.isArray(p.photos)) {
     o.photoCount = p.photos.length;
-    o.photos = p.photos.length ? [p.photos[0]] : [];
+    // Prefer the small client-generated thumbnail (~30 KB) over the full
+    // 700+ KB image. Fall back to photos[0] for older posts that have no
+    // thumbs[] field yet.
+    const cover = (Array.isArray(p.thumbs) && p.thumbs[0]) || p.photos[0] || '';
+    o.photos = cover ? [cover] : [];
+    delete o.thumbs;
   }
   if (typeof p.photo === 'string' && p.photo) {
     o.hasPhoto = true;
-    // Keep p.photo for QA cards' thumbnail; that one's already a single image.
+    if (typeof p.photoThumb === 'string' && p.photoThumb) {
+      o.photo = p.photoThumb;
+    }
+    delete o.photoThumb;
   }
   if (typeof p.audio === 'string' && p.audio) {
     o.hasAudio = true;
@@ -1066,7 +1093,8 @@ function validateStudentExtras(body) {
   }
   const audioCheck = validateAudio(body && body.audio);
   if (audioCheck.err) errs.push(audioCheck.err);
-  return { errs, clean: { location, title, photos, audio: audioCheck.audio || null } };
+  const thumbs = parseOptionalThumbs(body && body.thumbs);
+  return { errs, clean: { location, title, photos, thumbs, audio: audioCheck.audio || null } };
 }
 function validateQaExtras(body) {
   const errs = [];
@@ -1079,9 +1107,10 @@ function validateQaExtras(body) {
     else if (photoRaw.length > 900000) errs.push('photo too large');
     else photo = photoRaw;
   }
+  const photoThumb = parseOptionalThumb(body && body.photoThumb);
   const audioCheck = validateAudio(body && body.audio);
   if (audioCheck.err) errs.push(audioCheck.err);
-  return { errs, clean: { title, photo, audio: audioCheck.audio || null } };
+  return { errs, clean: { title, photo, photoThumb, audio: audioCheck.audio || null } };
 }
 function validateNatureExtras(body) {
   const errs = [];
@@ -1109,7 +1138,21 @@ function validateNatureExtras(body) {
   }
   const audioCheck = validateAudio(body && body.audio);
   if (audioCheck.err) errs.push(audioCheck.err);
-  return { errs, clean: { title, origin, source, photos, audio: audioCheck.audio || null } };
+  const thumbs = parseOptionalThumbs(body && body.thumbs);
+  return { errs, clean: { title, origin, source, photos, thumbs, audio: audioCheck.audio || null } };
+}
+
+// Lightweight optional-thumb validators: ignore anything that isn't a valid
+// small data URL so a missing/garbled thumb doesn't reject the whole post.
+function parseOptionalThumb(raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+  if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(raw)) return null;
+  if (raw.length > 200000) return null;
+  return raw;
+}
+function parseOptionalThumbs(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(parseOptionalThumb);
 }
 
 function validatePost(type, body) {
@@ -1203,11 +1246,13 @@ async function handlePostsApi(req, res, type, sub) {
     if (body && Object.prototype.hasOwnProperty.call(body, 'photo') && type === 'qa') {
       if (body.photo === null || body.photo === '') {
         list[idx].photo = null;
+        list[idx].photoThumb = null;
       } else if (typeof body.photo === 'string') {
         if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(body.photo) || body.photo.length > 900000) {
           return sendJSON(res, 400, { error: 'photo invalid' });
         }
         list[idx].photo = body.photo;
+        list[idx].photoThumb = parseOptionalThumb(body.photoThumb);
       }
     }
     if (type === 'student') {
@@ -1226,6 +1271,7 @@ async function handlePostsApi(req, res, type, sub) {
           }
         }
         list[idx].photos = body.photos.slice();
+        if (Array.isArray(body && body.thumbs)) list[idx].thumbs = parseOptionalThumbs(body.thumbs);
       }
     } else if (type === 'qa' || type === 'nature') {
       if (body && typeof body.title === 'string') {
