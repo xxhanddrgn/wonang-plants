@@ -697,6 +697,31 @@ async function handleApi(req, res, url) {
     if (!requireAdmin(req, res)) return;
     return sendJSON(res, 200, { ok: true });
   }
+  if (url === '/api/admin/save-thumbs' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    let body;
+    try { body = await readJSONBody(req, 6_000_000); }
+    catch (e) { return sendJSON(res, e.message === 'body too large' ? 413 : 400, { error: e.message }); }
+    const board = String((body && body.board) || '');
+    const postId = String((body && body.postId) || '');
+    if (!postId) return sendJSON(res, 400, { error: 'postId required' });
+    if (!POST_TYPES[board]) return sendJSON(res, 400, { error: 'unknown board' });
+    const list = readPostFile(board);
+    const idx = list.findIndex((e) => e.id === postId);
+    if (idx === -1) return sendJSON(res, 404, { error: 'post not found' });
+    let touched = false;
+    if (Array.isArray(body.thumbs)) {
+      list[idx].thumbs = parseOptionalThumbs(body.thumbs);
+      touched = true;
+    }
+    if (typeof body.photoThumb === 'string') {
+      list[idx].photoThumb = parseOptionalThumb(body.photoThumb);
+      touched = true;
+    }
+    if (!touched) return sendJSON(res, 400, { error: 'thumbs or photoThumb required' });
+    await writePostFile(board, list);
+    return sendJSON(res, 200, { ok: true });
+  }
   if (url === '/api/admin/rename' && req.method === 'POST') {
     if (!requireAdmin(req, res)) return;
     let body;
