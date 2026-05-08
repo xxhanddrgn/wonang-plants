@@ -1021,14 +1021,52 @@ for (const t of Object.keys(POST_TYPES)) {
   if (!fs.existsSync(f)) { try { fs.writeFileSync(f, '[]', 'utf-8'); } catch (_) {} }
 }
 const postWriteChains = {};
+// In-memory cache so we don't re-read and re-parse a multi-MB JSON file on
+// every list/detail request. The album list endpoint used to read the full
+// posts-student.json (containing every base64 photo + audio) on each GET,
+// which made navigating to the album feel slow even though the response is
+// "light". We keep the parsed list, a precomputed light JSON/gzip buffer,
+// and an ETag so subsequent requests return cached bytes (or 304) instantly.
+const postCacheState = {};
+function getCachedPostList(type) {
+  let st = postCacheState[type];
+  if (!st) st = postCacheState[type] = { list: null, lightJson: null, lightGzip: null, etag: null };
+  if (!st.list) {
+    try {
+      const raw = fs.readFileSync(POST_TYPES[type].file, 'utf-8');
+      const arr = JSON.parse(raw);
+      st.list = Array.isArray(arr) ? arr : [];
+    } catch (e) { st.list = []; }
+  }
+  return st.list;
+}
+function invalidatePostLightCache(type) {
+  const st = postCacheState[type];
+  if (st) { st.lightJson = null; st.lightGzip = null; st.etag = null; }
+}
+function getLightListPayload(type) {
+  let st = postCacheState[type];
+  if (!st) st = postCacheState[type] = { list: null, lightJson: null, lightGzip: null, etag: null };
+  if (!st.lightJson) {
+    const list = getCachedPostList(type);
+    const json = JSON.stringify({ list: toLightList(list) });
+    st.lightJson = Buffer.from(json, 'utf-8');
+    try { st.lightGzip = zlib.gzipSync(st.lightJson); } catch (_) { st.lightGzip = null; }
+    st.etag = '"' + crypto.createHash('sha1').update(st.lightJson).digest('base64').replace(/=+$/, '') + '"';
+  }
+  return st;
+}
 function readPostFile(type) {
-  try {
-    const raw = fs.readFileSync(POST_TYPES[type].file, 'utf-8');
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) { return []; }
+  // Return the cached list reference. Callers that mutate (push/splice/edit)
+  // call writePostFile afterward, which invalidates the derived light cache.
+  return getCachedPostList(type);
 }
 function writePostFile(type, list) {
+  // Update in-memory cache synchronously so subsequent reads see the new
+  // state immediately, then persist to disk asynchronously.
+  if (!postCacheState[type]) postCacheState[type] = { list: null, lightJson: null, lightGzip: null, etag: null };
+  postCacheState[type].list = list;
+  invalidatePostLightCache(type);
   const f = POST_TYPES[type].file;
   postWriteChains[type] = (postWriteChains[type] || Promise.resolve()).then(() => new Promise((resolve, reject) => {
     const tmp = f + '.tmp';
@@ -1206,8 +1244,29 @@ async function handlePostsApi(req, res, type, sub) {
   // boards used to push every base64 photo and audio in one response,
   // which made the page take seconds to load for a board with many posts.
   // Detail screens refetch the full post via /api/posts/:type/item/:id.
+  // The light response body + gzip + ETag are cached in memory and only
+  // recomputed when a write invalidates the cache, so the disk read and
+  // JSON.parse of a multi-MB file no longer happen per request.
   if (sub === '' && req.method === 'GET') {
-    return sendJSON(res, 200, { list: toLightList(readPostFile(type)) });
+    const payload = getLightListPayload(type);
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && payload.etag && ifNoneMatch === payload.etag) {
+      res.writeHead(304, { 'ETag': payload.etag, 'Cache-Control': 'no-cache' });
+      return res.end();
+    }
+    const accept = req.headers['accept-encoding'] || '';
+    const useGzip = !!(payload.lightGzip && /gzip/i.test(accept));
+    const body = useGzip ? payload.lightGzip : payload.lightJson;
+    const headers = {
+      'Content-Type': MIME['.json'],
+      'Cache-Control': 'no-cache',
+      'ETag': payload.etag,
+      'Content-Length': body.length,
+      'Vary': 'Accept-Encoding'
+    };
+    if (useGzip) headers['Content-Encoding'] = 'gzip';
+    res.writeHead(200, headers);
+    return res.end(body);
   }
   // GET /api/posts/:type/item/:id — full post, used by the detail screen.
   if (req.method === 'GET' && /^item\/[A-Za-z0-9_-]+$/.test(sub)) {
